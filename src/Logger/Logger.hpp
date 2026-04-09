@@ -33,17 +33,25 @@ public:
          const std::vector<std::shared_ptr<LogFlush>> &outputs)
       : logger_name_(logger_name), outputs_(outputs) {}
 
-  // 定义了5个接口的调用方式
-  // 进入函数后会先把变参整理成正文，再交给 serialize。
-  // 最后这个 ... 就表示：从 fmt 后面开始，还可以继续传很多参数，传几个都行。
   /*
-  1. 把 ... 那些参数接过来
-  2. 按 fmt 拼成正文字符串
-  3. 带着 INFO 级别、文件名、行号、正文，去调用 serialize
-  4. serialize 再补齐时间和线程
-  5. 生成最终日志文本
-  6. 发给 outputs_ 里的所有输出器*/
+      Debug:
 
+      供谁调用：
+      - 业务代码调用 Logger::Debug
+
+      参数：
+      - file: 源文件名（一般传 __FILE__）
+      - line: 源码行号（一般传 __LINE__）
+      - fmt:  printf 风格格式串
+      - ...:  对应 fmt 的可变参数
+
+      过程：
+      1. 把 fmt + 可变参数整理成正文字符串
+      2. 交给 serialize 组装完整日志并分发给输出器列表
+
+      返回：
+      - 无返回值，日志会被发送到 outputs_ 中的各个输出器
+  */
   void Debug(const char *file, size_t line, const char *fmt, ...) {
     va_list args; // args是接管 ... 那部分参数的读取器
     // va_list 可变参数:一个函数可以接收“数量不固定”的额外参数
@@ -91,13 +99,21 @@ public:
 
 private:
   /*
-      formatPayload 负责把 printf 风格参数变成 std::string。
+      formatPayload:
 
-      这里分两次调用 vsnprintf：
-      1. 第一次只计算正文长度
-      2. 第二次把内容真正写入字符串
+      供谁调用：
+      - Debug / Info / Warn / Error / Fatal
 
-      这样做的原因是正文长度在格式化之前并不知道。
+      参数：
+      - fmt:  printf 风格格式串
+      - args: 可变参数列表
+
+      行为：
+      - 第一次 vsnprintf 只计算正文长度
+      - 第二次 vsnprintf 写入最终正文
+
+      返回：
+      - 拼接完成的正文字符串
   */
   std::string formatPayload(const char *fmt, va_list args) const {
     // args_copy 用来做第一次长度计算。
@@ -117,16 +133,21 @@ private:
   }
 
   /*
-      serialize 负责把零散信息组装成一条完整日志。
+      serialize:
 
-      这一步会补齐四类信息：
-      - 当前时间
-      - 当前线程 ID
-      - 文件名和行号
-      - 日志级别和正文
+      供谁调用：
+      - Debug / Info / Warn / Error / Fatal
 
-      然后调用 LogMessage::format() 生成最终字符串，
-      再把这条字符串交给 outputs_ 里的每个输出器。
+      参数：
+      - level:  日志级别
+      - file:   源文件名
+      - line:   源码行号
+      - payload: 已经格式化好的正文
+
+      行为：
+      1. 组装 LogMessage（补齐时间、线程、文件、行号、级别、正文）
+      2. 调用 LogMessage::format() 生成最终字符串
+      3. 遍历 outputs_，把这条日志交给每个输出器
   */
   void serialize(LogLevel::value level, const std::string &file, size_t line,
                  const std::string &payload) {

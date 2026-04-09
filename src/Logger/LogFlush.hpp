@@ -26,13 +26,30 @@ class LogFlush {
 public:
   virtual ~LogFlush() = default;
 
-  // Flush 接收一段已经格式化完成的日志数据。
+  /*
+      Flush:
+
+      供谁调用：
+      - Logger::serialize
+
+      参数：
+      - data: 已经格式化好的日志字符串数据
+      - len:  data 的字节长度
+
+      行为：
+      - 子类决定如何输出这段日志（终端/文件等）
+  */
   virtual void Flush(const char *data, size_t len) = 0;
 };
 
 // StdoutFlush 是终端输出器。
 class StdoutFlush : public LogFlush {
 public:
+  /*
+      Flush:
+      - 直接写到 std::cout
+      - flush 确保立即输出到终端
+  */
   void Flush(const char *data, size_t len) override {
     std::cout.write(data, static_cast<std::streamsize>(len));
     std::cout.flush();
@@ -47,6 +64,11 @@ public:
 */
 class FileFlush : public LogFlush {
 public:
+  /*
+      构造函数：
+      - file_path: 日志文件路径
+      - 打开失败时抛异常，避免对象处于不可用状态
+  */
   explicit FileFlush(const std::string &file_path)
       : ofs_(file_path, std::ios::app | std::ios::binary) {
     if (!ofs_.is_open()) {
@@ -54,6 +76,11 @@ public:
     }
   }
 
+  /*
+      Flush:
+      - 把日志写入文件
+      - flush 立即刷新到磁盘
+  */
   void Flush(const char *data, size_t len) override {
     ofs_.write(data, static_cast<std::streamsize>(len));
     ofs_.flush();
