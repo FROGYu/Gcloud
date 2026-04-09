@@ -27,6 +27,24 @@
 */
 
 /*
+    RotateLoggerConfig:
+
+    作用：
+    - 把“滚动日志器初始化时需要的一组参数”收在一起
+    - 避免初始化函数参数越写越多
+
+    字段说明：
+    - logger_name: 要注册到 LoggerManager 中的日志器名字
+    - base_file_name: 日志文件的基础文件名
+    - max_file_size: 单个日志文件允许写入的最大字节数
+*/
+struct RotateLoggerConfig {
+  std::string logger_name;
+  std::string base_file_name;
+  size_t max_file_size = 0;
+};
+
+/*
     BuildLoggerLogDir:
 
     参数：
@@ -49,9 +67,7 @@ inline std::filesystem::path BuildLoggerLogDir(const char *source_file) {
 
     参数：
     - source_file: 当前源码文件路径，一般直接传 __FILE__
-    - logger_name: 要注册的默认日志器名字
-    - base_file_name: 滚动日志文件的基础文件名
-    - max_file_size: 单个日志文件允许的最大字节数
+    - config: 初始化滚动日志器所需的配置
 
     作用：
     - 计算固定日志目录
@@ -63,17 +79,16 @@ inline std::filesystem::path BuildLoggerLogDir(const char *source_file) {
     - 注册进去的默认日志器对象
 */
 inline std::shared_ptr<AsyncLogger>
-InitDefaultRotateLogger(const char *source_file, const std::string &logger_name,
-                        const std::string &base_file_name,
-                        size_t max_file_size) {
+InitDefaultRotateLogger(const char *source_file,
+                        const RotateLoggerConfig &config) {
   std::filesystem::path log_dir = BuildLoggerLogDir(source_file);
-  std::filesystem::path log_file_path = log_dir / base_file_name;
+  std::filesystem::path log_file_path = log_dir / config.base_file_name;
 
   std::vector<std::shared_ptr<LogFlush>> outputs;
-  outputs.push_back(
-      std::make_shared<SizeRotateFileFlush>(log_file_path.string(), max_file_size));
+  outputs.push_back(std::make_shared<SizeRotateFileFlush>(
+      log_file_path.string(), config.max_file_size));
 
-  auto logger = std::make_shared<AsyncLogger>(logger_name, outputs);
-  LoggerManager::Instance().RegisterLogger(logger_name, logger);
+  auto logger = std::make_shared<AsyncLogger>(config.logger_name, outputs);
+  LoggerManager::Instance().RegisterLogger(config.logger_name, logger);
   return logger;
 }

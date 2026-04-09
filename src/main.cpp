@@ -5,11 +5,14 @@
 #include <vector>
 
 namespace {
-constexpr const char *kDefaultLoggerName = "default";
-constexpr const char *kRotateBaseFileName = "rotate_test.log";
-constexpr size_t kMaxFileSize = 64 * 1024;
 constexpr int kThreadCount = 4;
 constexpr int kLogCountPerThread = 400;
+
+const RotateLoggerConfig kDefaultRotateLoggerConfig = {
+    .logger_name = "default",
+    .base_file_name = "rotate_test.log",
+    .max_file_size = 64 * 1024,
+};
 
 void runRotateFlushTest() {
   // 这里启动多个业务线程，持续写日志。
@@ -44,8 +47,7 @@ int main() {
 
   // 这里完成日志系统初始化。
   // 业务代码不再自己手动创建输出器、日志器和注册流程。
-  InitDefaultRotateLogger(__FILE__, kDefaultLoggerName, kRotateBaseFileName,
-                          kMaxFileSize);
+  InitDefaultRotateLogger(__FILE__, kDefaultRotateLoggerConfig);
   runRotateFlushTest();
 
   return 0;
