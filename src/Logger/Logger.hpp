@@ -16,14 +16,19 @@
 #include <vector>
 
 /*
-    Logger 是第一阶段直接给业务代码使用的类。
+    Logger 所在层级：日志系统的“对外日志器层”。
 
-    业务代码调用 Logger::Info、Logger::Error 这类接口时，
-    不需要自己手动创建 LogMessage，也不需要自己决定写到终端还是文件。
+    Logger 表示同步日志器。
 
-    Logger 在中间做两件事：
-    1. 把变参整理成日志正文
-    2. 组装完整日志，并交给各个输出器
+    同步的含义是：
+    - 业务线程调用 Info / Error 这类接口后
+    - 日志会在这次调用里直接交给输出器处理
+    - 不经过后台线程
+    - 不经过双缓冲
+
+    适用场景：
+    - 先把日志链路跑通
+    - 先验证日志格式和输出器行为
 */
 class Logger {
 public:
@@ -47,7 +52,7 @@ public:
 
       过程：
       1. 把 fmt + 可变参数整理成正文字符串
-      2. 交给 serialize 组装完整日志并分发给输出器列表
+      2. 交给 serialize 组装完整日志并同步分发给输出器列表
 
       返回：
       - 无返回值，日志会被发送到 outputs_ 中的各个输出器
@@ -147,7 +152,7 @@ private:
       行为：
       1. 组装 LogMessage（补齐时间、线程、文件、行号、级别、正文）
       2. 调用 LogMessage::format() 生成最终字符串
-      3. 遍历 outputs_，把这条日志交给每个输出器
+      3. 遍历 outputs_，把这条日志直接交给每个输出器
   */
   void serialize(LogLevel::value level, const std::string &file, size_t line,
                  const std::string &payload) {
