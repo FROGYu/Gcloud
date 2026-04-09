@@ -1,13 +1,34 @@
 #include "Logger/LogMacros.hpp"
+#include "Util/LoggerInit.hpp"
 
-#include <memory>
 #include <thread>
 #include <vector>
 
 namespace {
-constexpr const char *kRotateBaseFilePath = "./rotate_test.log";
 constexpr const char *kDefaultLoggerName = "default";
-constexpr size_t kMaxFileSize = 2048;
+constexpr const char *kRotateBaseFileName = "rotate_test.log";
+constexpr size_t kMaxFileSize = 64 * 1024;
+constexpr int kThreadCount = 4;
+constexpr int kLogCountPerThread = 400;
+
+void runRotateFlushTest() {
+  // 这里启动多个业务线程，持续写日志。
+  // 如果 SizeRotateFileFlush 正常工作，
+  // 运行结束后应该能在 src/Logger/logs 里看到多个 rotate_test_*.log 文件。
+  std::vector<std::thread> workers;
+
+  for (int i = 0; i < kThreadCount; ++i) {
+    workers.emplace_back([i]() {
+      for (int j = 0; j < kLogCountPerThread; ++j) {
+        LOG_INFO("rotate test: thread=%d, log_index=%d", i, j);
+      }
+    });
+  }
+
+  for (auto &worker : workers) {
+    worker.join();
+  }
+}
 }
 
 int main() {
@@ -21,34 +42,11 @@ int main() {
       - 不把多个日志器共享同一个输出器的并发问题混进来
   */
 
-  // 这里使用一个很小的文件大小上限，目的是让测试运行一次就能看到切文件效果。
-  std::shared_ptr<LogFlush> rotate_file_flush =
-      std::make_shared<SizeRotateFileFlush>(kRotateBaseFilePath, kMaxFileSize);
-  std::vector<std::shared_ptr<LogFlush>> outputs;
-  outputs.push_back(rotate_file_flush);
-
-  // 这次只注册一个默认日志器，业务线程统一通过 LOG_INFO 写日志。
-  auto default_logger = std::make_shared<AsyncLogger>(kDefaultLoggerName, outputs);
-
-  LoggerManager::Instance().RegisterLogger(kDefaultLoggerName, default_logger);
-
-  // 启动多个业务线程，持续写日志。
-  // 如果 SizeRotateFileFlush 正常工作，运行结束后应该能看到多个 rotate_test_*.log 文件。
-  const int thread_count = 4;
-  const int log_count_per_thread = 400;
-  std::vector<std::thread> workers;
-
-  for (int i = 0; i < thread_count; ++i) {
-    workers.emplace_back([i, log_count_per_thread]() {
-      for (int j = 0; j < log_count_per_thread; ++j) {
-        LOG_INFO("rotate test: thread=%d, log_index=%d", i, j);
-      }
-    });
-  }
-
-  for (auto &worker : workers) {
-    worker.join();
-  }
+  // 这里完成日志系统初始化。
+  // 业务代码不再自己手动创建输出器、日志器和注册流程。
+  InitDefaultRotateLogger(__FILE__, kDefaultLoggerName, kRotateBaseFileName,
+                          kMaxFileSize);
+  runRotateFlushTest();
 
   return 0;
 }

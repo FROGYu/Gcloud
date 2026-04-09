@@ -223,6 +223,7 @@ private:
 
       作用：
       - 关闭旧文件
+      - 确保日志文件所在目录存在
       - 生成新文件名
       - 打开新文件
       - 把 current_file_size_ 归零
@@ -232,8 +233,15 @@ private:
       - 所以再追加一个递增编号
   */
   void openNewFile() {
+    namespace fs = std::filesystem;
+
     if (ofs_.is_open()) {
       ofs_.close();
+    }
+
+    fs::path base_path(base_file_path_);
+    if (base_path.has_parent_path() && !fs::exists(base_path.parent_path())) {
+      fs::create_directories(base_path.parent_path());
     }
 
     const std::string new_file_name = makeFileName();
