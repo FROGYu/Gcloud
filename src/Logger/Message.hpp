@@ -25,36 +25,44 @@ struct LogMessage {
   // 日志正文。
   std::string payload_;
 
-    /*
-        format:
+  /*
+      format:
 
-        供谁调用：
-        - Logger::publishLog
-        - AsyncLogger::publishLog
+      供谁调用：
+      - Logger::publishLog
+      - AsyncLogger::publishLog
 
-        作用：
-        - 把当前这条日志对象整理成一行字符串
+      作用：
+      - 把当前这条日志对象整理成一行字符串
 
-        关键点：
-        - ctime_ 是时间戳，需要转成本地时间
-        - level_ 是枚举，需要转成字符串
-        - line_ 是数字，直接拼接
+      关键点：
+      - ctime_ 是时间戳，需要转成本地时间
+      - level_ 是枚举，需要转成字符串
+      - line_ 是数字，直接拼接
 
-        最终格式：
-        [14:23:05][14012345][INFO][main.cpp:25] 用户登录成功
+      最终格式：
+      [14:23:05][14012345][INFO][main.cpp:25] 用户登录成功
 
-        返回：
-        - 拼接完成的日志字符串
-    */
-    std::string format() const {
-        // 根据时间戳生成本地时间对象。
-        auto time_point = std::chrono::system_clock::from_time_t(ctime_);
-        std::time_t current_time = std::chrono::system_clock::to_time_t(time_point);
-    std::tm *tm_time = std::localtime(&current_time);
+      返回：
+      - 拼接完成的日志字符串
+  */
+  std::string format() const {
+    auto time_point = std::chrono::system_clock::from_time_t(ctime_);
+    std::time_t current_time = std::chrono::system_clock::to_time_t(time_point);
+
+    // 把时间戳转换成本地时间。
+    // 这里不能直接用 std::localtime，因为它返回的是静态对象地址。
+    // 多个线程同时格式化日志时，时间内容可能互相覆盖。
+    std::tm tm_time{};
+#ifdef _WIN32
+    localtime_s(&tm_time, &current_time);
+#else
+    localtime_r(&current_time, &tm_time);
+#endif
 
     // 按固定顺序拼接日志内容。
     std::ostringstream oss;
-    oss << '[' << std::put_time(tm_time, "%H:%M:%S") << ']' << '[' << tid_
+    oss << '[' << std::put_time(&tm_time, "%H:%M:%S") << ']' << '[' << tid_
         << ']' << '[' << LogLevel::ToString(level_) << ']' << '[' << file_name_
         << ':' << line_ << "] " << payload_ << '\n';
     return oss.str();
