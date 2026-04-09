@@ -30,7 +30,8 @@ public:
       Flush:
 
       供谁调用：
-      - Logger::serialize
+      - Logger::publishLog
+      - AsyncLogger::consume
 
       参数：
       - data: 已经格式化好的日志字符串数据

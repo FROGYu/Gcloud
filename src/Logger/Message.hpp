@@ -29,7 +29,8 @@ struct LogMessage {
         format:
 
         供谁调用：
-        - Logger::serialize
+        - Logger::publishLog
+        - AsyncLogger::publishLog
 
         作用：
         - 把当前这条日志对象整理成一行字符串

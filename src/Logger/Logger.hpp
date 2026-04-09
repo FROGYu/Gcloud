@@ -52,7 +52,7 @@ public:
 
       过程：
       1. 把 fmt + 可变参数整理成正文字符串
-      2. 交给 serialize 组装完整日志并同步分发给输出器列表
+      2. 交给 publishLog 组装完整日志并同步分发给输出器列表
 
       返回：
       - 无返回值，日志会被发送到 outputs_ 中的各个输出器
@@ -65,7 +65,7 @@ public:
     std::string payload = formatPayload(
         fmt, args); // 把模板 fmt 和参数 args 合起来，生成真正的日志正文。
     va_end(args); // args 这次可变参数读取用完了，现在结束它。
-    serialize(
+    publishLog(
         LogLevel::DEBUG, file, line,
         payload); // 正文已经准备好了，现在按 DEBUG 级别，把它组装成完整日志。
   }
@@ -75,7 +75,7 @@ public:
     va_start(args, fmt);
     std::string payload = formatPayload(fmt, args);
     va_end(args);
-    serialize(LogLevel::INFO, file, line, payload);
+    publishLog(LogLevel::INFO, file, line, payload);
   }
 
   void Warn(const char *file, size_t line, const char *fmt, ...) {
@@ -83,7 +83,7 @@ public:
     va_start(args, fmt);
     std::string payload = formatPayload(fmt, args);
     va_end(args);
-    serialize(LogLevel::WARN, file, line, payload);
+    publishLog(LogLevel::WARN, file, line, payload);
   }
 
   void Error(const char *file, size_t line, const char *fmt, ...) {
@@ -91,7 +91,7 @@ public:
     va_start(args, fmt);
     std::string payload = formatPayload(fmt, args);
     va_end(args);
-    serialize(LogLevel::ERROR, file, line, payload);
+    publishLog(LogLevel::ERROR, file, line, payload);
   }
 
   void Fatal(const char *file, size_t line, const char *fmt, ...) {
@@ -99,7 +99,7 @@ public:
     va_start(args, fmt);
     std::string payload = formatPayload(fmt, args);
     va_end(args);
-    serialize(LogLevel::FATAL, file, line, payload);
+    publishLog(LogLevel::FATAL, file, line, payload);
   }
 
 private:
@@ -138,7 +138,7 @@ private:
   }
 
   /*
-      serialize:
+      publishLog:
 
       供谁调用：
       - Debug / Info / Warn / Error / Fatal
@@ -153,9 +153,11 @@ private:
       1. 组装 LogMessage（补齐时间、线程、文件、行号、级别、正文）
       2. 调用 LogMessage::format() 生成最终字符串
       3. 遍历 outputs_，把这条日志直接交给每个输出器
+      同步日志器是直接交给输出器
+
   */
-  void serialize(LogLevel::value level, const std::string &file, size_t line,
-                 const std::string &payload) {
+  void publishLog(LogLevel::value level, const std::string &file, size_t line,
+                  const std::string &payload) {
     LogMessage msg;
     msg.ctime_ = std::time(nullptr);
     msg.tid_ = std::this_thread::get_id();
