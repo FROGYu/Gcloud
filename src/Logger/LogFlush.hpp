@@ -148,25 +148,34 @@ public:
       - len:  data 的字节长度
 
       行为：
-      - 如果当前文件再写这一条日志就会超过上限，先切到新文件
-      - 然后把这条日志写入当前文件
-      - 最后更新 current_file_size_
+      - 如果这一批数据放不进当前文件，就先把当前文件剩余空间写满
+      - 剩下的数据切到新文件继续写
+      - 直到这一批数据全部写完
   */
   void Flush(const char *data, size_t len) override {
     if (!ofs_.is_open()) {
       openNewFile();
     }
 
-    // 策略 A：
-    // 如果“当前大小 + 这一条日志大小”会超过上限，
-    // 先切换到新文件，再写这一条日志。
-    if (current_file_size_ + len > max_file_size_) {
-      openNewFile();
-    }
+    const char *write_ptr = data;
+    size_t remaining_size = len;
 
-    ofs_.write(data, static_cast<std::streamsize>(len));
-    ofs_.flush();
-    current_file_size_ += len;
+    while (remaining_size > 0) {
+      // 当前文件已经写满时，先切到新文件。
+      if (current_file_size_ == max_file_size_) {
+        openNewFile();
+      }
+
+      const size_t writable_size = max_file_size_ - current_file_size_;
+      const size_t chunk_size = std::min(remaining_size, writable_size);
+
+      ofs_.write(write_ptr, static_cast<std::streamsize>(chunk_size));
+      ofs_.flush();
+
+      write_ptr += chunk_size;
+      remaining_size -= chunk_size;
+      current_file_size_ += chunk_size;
+    }
   }
 
 private:
