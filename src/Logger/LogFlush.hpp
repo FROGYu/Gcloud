@@ -148,8 +148,9 @@ public:
       - len:  data 的字节长度
 
       行为：
-      - 如果这一批数据放不进当前文件，就先把当前文件剩余空间写满
-      - 剩下的数据切到新文件继续写
+      - 优先在换行符处切分，避免把一条完整日志拆到两个文件里
+      - 如果当前文件剩余空间不足以放下下一段完整日志，就先切到新文件
+      - 如果单条日志本身已经超过上限，就允许这个文件超过上限，但不把这一条拆开
       - 直到这一批数据全部写完
   */
   void Flush(const char *data, size_t len) override {
@@ -167,7 +168,13 @@ public:
       }
 
       const size_t writable_size = max_file_size_ - current_file_size_;
-      const size_t chunk_size = std::min(remaining_size, writable_size);
+      size_t chunk_size = decideChunkSize(write_ptr, remaining_size, writable_size);
+
+      // 当前文件剩余空间里放不下一条完整日志时，先切到新文件再重新计算。
+      if (chunk_size == 0) {
+        openNewFile();
+        continue;
+      }
 
       ofs_.write(write_ptr, static_cast<std::streamsize>(chunk_size));
       ofs_.flush();
@@ -179,6 +186,56 @@ public:
   }
 
 private:
+  /*
+      decideChunkSize:
+
+      参数：
+      - data: 当前还没有写出去的数据起点
+      - remaining_size: 当前还剩多少字节没有写
+      - writable_size: 当前文件还剩多少可写空间
+
+      返回：
+      - 本轮应该写多少字节
+
+      规则：
+      - 优先在 writable_size 范围内找最后一个 '\n'
+      - 找到了，就写到这个 '\n' 为止
+      - 没找到且当前文件不是空文件，返回 0，让外层先切文件
+      - 没找到且当前文件是空文件，说明单条日志本身就超过上限
+        这时继续往后找这一条日志的结尾，把整条日志写进当前文件
+  */
+  size_t decideChunkSize(const char *data, size_t remaining_size,
+                         size_t writable_size) const {
+    if (remaining_size == 0) {
+      return 0;
+    }
+
+    const size_t search_size = std::min(remaining_size, writable_size);
+    for (size_t i = search_size; i > 0; --i) {
+      if (data[i - 1] == '\n') {
+        return i;
+      }
+    }
+
+    // 当前文件里已经有内容，但剩余空间放不下一条完整日志。
+    // 这时不在中间硬切，而是让外层直接换新文件。
+    if (current_file_size_ > 0) {
+      return 0;
+    }
+
+    // 当前文件是空文件，说明一条日志本身就比上限更长。
+    // 这时继续向后找到这条日志真正的结尾，允许这个文件超过上限，
+    // 但不把这一条日志拆成两半。
+    for (size_t i = search_size; i < remaining_size; ++i) {
+      if (data[i] == '\n') {
+        return i + 1;
+      }
+    }
+
+    // 如果最后一条数据本身就没有换行符，直接把剩余内容全写进去。
+    return remaining_size;
+  }
+
   /*
       makeFileName:
 
