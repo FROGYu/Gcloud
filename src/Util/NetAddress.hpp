@@ -6,6 +6,8 @@
 
 /*
     NetAddress.hpp 负责准备 IPv4 地址结构体。
+    以及把 sockaddr_in*
+    转成系统调用需要的 sockaddr*（AsSockAddr）。
 */
 
 /*
