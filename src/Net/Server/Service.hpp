@@ -38,12 +38,14 @@ class Service {
     address_ = address;
     port_ = port;
 
+    // event_base_new: 创建整个 libevent 的事件底座，后面的事件循环都依赖它。
     base_ = event_base_new();
     if (base_ == nullptr) {
       LOG_ERROR("创建 event_base 失败");
       return false;
     }
 
+    // evhttp_new: 基于 base_ 创建 HTTP 服务对象，后续专门用它接收和解析 HTTP 请求。
     http_ = evhttp_new(base_);
     if (http_ == nullptr) {
       LOG_ERROR("创建 evhttp 服务失败");
@@ -54,6 +56,7 @@ class Service {
     // 注册统一请求入口，并把当前对象地址作为上下文一并交给 libevent 保存。
     evhttp_set_gencb(http_, &Service::HttpRequestCb, this);
 
+    // evhttp_bind_socket: 把 http_ 绑定到指定地址和端口上，开始对外监听。
     if (evhttp_bind_socket(http_, address_.c_str(), static_cast<uint16_t>(port_)) != 0) {
       LOG_ERROR("绑定 HTTP 监听失败, address=%s, port=%u", address_.c_str(),
                 static_cast<unsigned>(port_));
@@ -80,6 +83,7 @@ class Service {
 
     LOG_INFO("HTTP 服务开始事件循环, address=%s, port=%u", address_.c_str(),
              static_cast<unsigned>(port_));
+    // event_base_dispatch: 启动事件循环，持续等待并分发 base_ 上注册的网络事件。
     int ret = event_base_dispatch(base_);
     if (ret != 0) {
       LOG_ERROR("事件循环异常退出, ret=%d", ret);
@@ -94,14 +98,15 @@ class Service {
   /*
       HttpRequestCb:
 
-      这是 libevent 的统一请求入口。收到 HTTP 请求后，先从 arg 中取回当前的
-      Service 对象，再转交给 HandleRequest 处理具体业务。
+      这是 libevent 的统一请求入口。收到 HTTP 请求后，先拿到request,再从 arg 中取回当前的
+      Service 对象，再把service和request转交给 HandleRequest 处理具体业务。
   */
   static void HttpRequestCb(evhttp_request* request, void* arg) {
     // 这里把回调上下文参数还原成当前 Service 对象，后续才能继续调用成员函数。
     Service* service = static_cast<Service*>(arg);
     if (service == nullptr) {
       if (request != nullptr) {
+        // evhttp_send_error: 直接给当前 request 返回错误响应，由 libevent 组装 HTTP 报文。
         evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
       }
       return;
@@ -113,54 +118,79 @@ class Service {
   /*
       HandleRequest:
 
-      这里执行真正的请求处理逻辑。它负责读取请求的 URI，构造响应缓冲区，设置响应
-      头并写入响应正文，最后把结果发回客户端，同时记录本次请求的耗时。
+      这里执行真正的对request处理逻辑。当前这一步先解析请求方法和路径，把完整 URI
+      整理成干净的路径字符串并记录日志。原来的测试响应先保留，下一步再继续接
+      入真正的路由分发。
   */
   void HandleRequest(evhttp_request* request) {
     const auto start_time = std::chrono::steady_clock::now();
 
+    // evhttp_request_get_command: 从 request 里读取这次 HTTP 请求的方法。
+    evhttp_cmd_type command = evhttp_request_get_command(request);
+    // evhttp_request_get_uri: 从 request 里读取原始 URI 字符串。
     const char* uri = evhttp_request_get_uri(request);
-    const char* safe_uri = (uri == nullptr) ? "/" : uri;
-    LOG_INFO("收到 HTTP 请求, uri=%s", safe_uri);
+    if (uri == nullptr) {
+      LOG_ERROR("解析请求失败, URI 为空");
+      evhttp_send_error(request, HTTP_BADREQUEST, "Bad Request");
+      return;
+    }
 
-    // 这里创建一块响应缓冲区，后面要回给客户端的正文，先写进这里
-    //HTTP 响应整体是：状态行 + 响应头 + 响应体
-    //状态行：后面 evhttp_send_reply 里给 响应头：后面 evhttp_add_header 响应体：写在 buffer 里
+    // evhttp_uri_parse: 把原始 URI 解析成结构化对象，后面才能继续拆路径。
+    evhttp_uri* decoded_uri = evhttp_uri_parse(uri);
+    if (decoded_uri == nullptr) {
+      LOG_ERROR("解析 URI 失败, uri=%s", uri);
+      evhttp_send_error(request, HTTP_BADREQUEST, "Bad Request");
+      return;
+    }
+
+    // evhttp_uri_get_path: 从解析后的 URI 对象里取出纯路径部分。
+    const char* path = evhttp_uri_get_path(decoded_uri);
+    std::string request_path = (path == nullptr || *path == '\0') ? "/" : path;
+    // evhttp_uri_free: 释放上面解析出来的 URI 对象。
+    evhttp_uri_free(decoded_uri);
+
+    const char* method_name = "UNKNOWN";
+    if (command == EVHTTP_REQ_GET) {
+      method_name = "GET";
+    } else if (command == EVHTTP_REQ_POST) {
+      method_name = "POST";
+    }
+
+    LOG_INFO("收到 HTTP 请求, method=%s, path=%s", method_name, request_path.c_str());
+
+    // evbuffer_new: 创建响应体缓冲区，后面返回给客户端的正文会先写到这里。
     evbuffer* buffer = evbuffer_new();
     if (buffer == nullptr) {
-      LOG_ERROR("创建响应缓冲区失败, uri=%s", safe_uri);
+      LOG_ERROR("创建响应缓冲区失败, path=%s", request_path.c_str());
       evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
       return;
     }
-    //从 request 里拿到“响应头容器” 后面往这个容器里加 header，最终会一起发给客户端
 
+    // evhttp_request_get_output_headers: 从 request 中取出响应头容器，后面往这里添加响应头。
     evkeyvalq* output_headers = evhttp_request_get_output_headers(request);
     if (output_headers != nullptr) {
+      // evhttp_add_header: 往响应头容器里添加一条头部，让客户端按指定方式解析响应体。
       evhttp_add_header(output_headers, "Content-Type", "text/plain; charset=utf-8");
-      // 先返回纯文本，后续切到 HTML 页面时只需要替换这里的 Content-Type。
-      // 客户端收到响应后，要根据 Content-Type 决定怎么解释 body
     }
 
+    // evbuffer_add_printf: 把格式化后的正文写进响应体缓冲区。
     if (evbuffer_add_printf(buffer, "Hello, Cloud Storage!") != 0) {
-      LOG_ERROR("写入响应缓冲区失败, uri=%s", safe_uri);
+      LOG_ERROR("写入响应缓冲区失败, path=%s", request_path.c_str());
       evbuffer_free(buffer);
       evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
       return;
     }
 
-    // 这里把状态码、状态文本和缓冲区正文一起发回浏览器。
+    // evhttp_send_reply: 把状态码、响应头和 buffer 里的响应体一起发回当前客户端。
     evhttp_send_reply(request, HTTP_OK, "OK", buffer);
+    // evbuffer_free: 释放响应体缓冲区，发送完成后这块临时内存就可以回收了。
     evbuffer_free(buffer);
-    /*
-        HTTP/1.1 200 OK
-        Content-Type: text/plain; charset=utf-8
-
-        Hello, Cloud Storage!*/
 
     const auto end_time = std::chrono::steady_clock::now();
     const auto cost_us =
         std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-    LOG_INFO("完成 HTTP 请求, uri=%s, cost_us=%lld", safe_uri, static_cast<long long>(cost_us));
+    LOG_INFO("完成 HTTP 请求, method=%s, path=%s, cost_us=%lld", method_name, request_path.c_str(),
+             static_cast<long long>(cost_us));
   }
 
   /*
@@ -169,13 +199,21 @@ class Service {
       这里释放当前 Service 持有的 libevent 资源。它会销毁 HTTP 服务对象和事件底
       座，避免资源泄漏，也让 Init 在重复调用时能够从干净状态重新开始。
   */
+  void GetMainPage(evhttp_request* request);
+
+  void UploadFile(evhttp_request* request);
+
+  void DownloadFile(evhttp_request* request);
+
   void Cleanup() {
     if (http_ != nullptr) {
+      // evhttp_free: 释放 HTTP 服务对象以及它内部持有的 HTTP 相关资源。
       evhttp_free(http_);
       http_ = nullptr;
     }
 
     if (base_ != nullptr) {
+      // event_base_free: 释放事件底座，归还整个事件循环占用的资源。
       event_base_free(base_);
       base_ = nullptr;
     }
