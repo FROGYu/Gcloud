@@ -118,9 +118,9 @@ class Service {
   /*
       HandleRequest:
 
-      这里执行真正的对request处理逻辑。当前这一步先解析请求方法和路径，把完整 URI
-      整理成干净的路径字符串并记录日志。原来的测试响应先保留，下一步再继续接
-      入真正的路由分发。
+      这里执行真正的对 request 处理逻辑。当前这一步先根据请求方法和路径做路由
+      分发，把请求交给主页、上传和下载三个处理函数。还没有匹配上的请求统一返
+      回 404，后面再继续往各自的处理函数里填具体业务。
   */
   void HandleRequest(evhttp_request* request) {
     const auto start_time = std::chrono::steady_clock::now();
@@ -158,10 +158,60 @@ class Service {
 
     LOG_INFO("收到 HTTP 请求, method=%s, path=%s", method_name, request_path.c_str());
 
+    if (command == EVHTTP_REQ_GET && request_path == "/") {
+      GetMainPage(request);
+    } else if (command == EVHTTP_REQ_POST && request_path == "/upload") {
+      UploadFile(request);
+    } else if (command == EVHTTP_REQ_GET && request_path.rfind("/download/", 0) == 0) {
+      DownloadFile(request);
+    } else {
+      LOG_ERROR("未匹配到路由, method=%s, path=%s", method_name, request_path.c_str());
+      // evhttp_send_error: 直接给当前 request 返回错误响应，由 libevent 组装 HTTP 报文。
+      evhttp_send_error(request, HTTP_NOTFOUND, "Not Found");
+    }
+
+    const auto end_time = std::chrono::steady_clock::now();
+    const auto cost_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+    LOG_INFO("完成 HTTP 请求, method=%s, path=%s, cost_us=%lld", method_name, request_path.c_str(),
+             static_cast<long long>(cost_us));
+  }
+
+  /*
+      GetMainPage:
+
+      这是主页路由的占位处理函数。当前先返回一段简单文本，用来确认 GET /
+      已经能够被正确分发到这里，后面再替换成真正的网页内容。
+  */
+  void GetMainPage(evhttp_request* request) { SendTextResponse(request, "main page"); }
+
+  /*
+      UploadFile:
+
+      这是上传路由的占位处理函数。当前先返回一段简单文本，用来确认 POST
+      /upload 已经能够被正确分发到这里，后面再继续接入文件上传逻辑。
+  */
+  void UploadFile(evhttp_request* request) { SendTextResponse(request, "upload"); }
+
+  /*
+      DownloadFile:
+
+      这是下载路由的占位处理函数。当前先返回一段简单文本，用来确认下载请求
+      已经能够被正确分发到这里，后面再继续接入真实的文件下载逻辑。
+  */
+  void DownloadFile(evhttp_request* request) { SendTextResponse(request, "download"); }
+
+  /*
+      SendTextResponse:
+
+      这是一个当前阶段的公共响应工具函数。主页、上传和下载三个占位处理函数都
+      先复用它返回纯文本响应，避免重复编写相同的缓冲区和响应头逻辑。
+  */
+  void SendTextResponse(evhttp_request* request, const char* body) {
     // evbuffer_new: 创建响应体缓冲区，后面返回给客户端的正文会先写到这里。
     evbuffer* buffer = evbuffer_new();
     if (buffer == nullptr) {
-      LOG_ERROR("创建响应缓冲区失败, path=%s", request_path.c_str());
+      LOG_ERROR("创建响应缓冲区失败");
       evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
       return;
     }
@@ -174,8 +224,8 @@ class Service {
     }
 
     // evbuffer_add_printf: 把格式化后的正文写进响应体缓冲区。
-    if (evbuffer_add_printf(buffer, "Hello, Cloud Storage!") != 0) {
-      LOG_ERROR("写入响应缓冲区失败, path=%s", request_path.c_str());
+    if (evbuffer_add_printf(buffer, "%s", body) != 0) {
+      LOG_ERROR("写入响应缓冲区失败");
       evbuffer_free(buffer);
       evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
       return;
@@ -185,12 +235,6 @@ class Service {
     evhttp_send_reply(request, HTTP_OK, "OK", buffer);
     // evbuffer_free: 释放响应体缓冲区，发送完成后这块临时内存就可以回收了。
     evbuffer_free(buffer);
-
-    const auto end_time = std::chrono::steady_clock::now();
-    const auto cost_us =
-        std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-    LOG_INFO("完成 HTTP 请求, method=%s, path=%s, cost_us=%lld", method_name, request_path.c_str(),
-             static_cast<long long>(cost_us));
   }
 
   /*
@@ -199,11 +243,6 @@ class Service {
       这里释放当前 Service 持有的 libevent 资源。它会销毁 HTTP 服务对象和事件底
       座，避免资源泄漏，也让 Init 在重复调用时能够从干净状态重新开始。
   */
-  void GetMainPage(evhttp_request* request);
-
-  void UploadFile(evhttp_request* request);
-
-  void DownloadFile(evhttp_request* request);
 
   void Cleanup() {
     if (http_ != nullptr) {
