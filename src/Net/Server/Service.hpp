@@ -1,6 +1,10 @@
 #pragma once
 
 #include "Logger/LogMacros.hpp"
+#include "Net/Server/Config/Config.hpp"
+#include "Net/Server/Data/FileMeta.hpp"
+#include "Net/Server/Data/FileTable.hpp"
+#include "Util/FileUtil.hpp"
 
 #include <event2/buffer.h>
 #include <event2/event.h>
@@ -8,6 +12,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <string>
 
 /*
@@ -188,10 +193,77 @@ class Service {
   /*
       UploadFile:
 
-      这是上传路由的占位处理函数。当前先返回一段简单文本，用来确认 POST
-      /upload 已经能够被正确分发到这里，后面再继续接入文件上传逻辑。
+      这里处理普通文件上传。它先从请求头里读取文件名和存储类型，再从输入缓冲区
+      里拷贝文件正文，最后把文件写入普通存储目录，并把对应的 FileMeta 登记到
+      FileTable 中。
   */
-  void UploadFile(evhttp_request* request) { SendTextResponse(request, "upload"); }
+  void UploadFile(evhttp_request* request) {
+    // evhttp_request_get_input_headers: 从 request 中取出客户端发来的请求头容器。
+    evkeyvalq* input_headers = evhttp_request_get_input_headers(request);
+    if (input_headers == nullptr) {
+      LOG_ERROR("上传失败, 请求头为空");
+      evhttp_send_error(request, HTTP_BADREQUEST, "Bad Request");
+      return;
+    }
+
+    // evhttp_find_header: 从请求头容器里查找指定头部字段。
+    const char* file_name = evhttp_find_header(input_headers, "File-Name");
+    const char* store_type = evhttp_find_header(input_headers, "Store-Type");
+    if (!IsValidUploadFileName(file_name)) {
+      LOG_ERROR("上传失败, 文件名非法");
+      evhttp_send_error(request, HTTP_BADREQUEST, "Bad Request");
+      return;
+    }
+
+    if (!IsValidStoreType(store_type)) {
+      LOG_ERROR("上传失败, 存储类型非法, file_name=%s", file_name);
+      evhttp_send_error(request, HTTP_BADREQUEST, "Bad Request");
+      return;
+    }
+
+    // evhttp_request_get_input_buffer: 从 request 中取出 POST 请求体(body 正文)所在的输入缓冲区。
+    evbuffer* input_buffer = evhttp_request_get_input_buffer(request);
+    if (input_buffer == nullptr) {
+      LOG_ERROR("上传失败, 请求体缓冲区为空, file_name=%s", file_name);
+      evhttp_send_error(request, HTTP_BADREQUEST, "Bad Request");
+      return;
+    }
+
+    // evbuffer_get_length: 获取输入缓冲区中当前保存的请求体字节数。
+    size_t body_length = evbuffer_get_length(input_buffer);
+    std::string file_body;
+    file_body.resize(body_length);  //用接收到的HTTP请求的正文的长度来初始化我们的string
+
+    // evbuffer_copyout: 把输入缓冲区里的文件正文拷贝到自己的 std::string file_body，不会消耗原缓冲区。
+    if (body_length > 0 && evbuffer_copyout(input_buffer, file_body.data(), body_length) !=
+                               static_cast<ev_ssize_t>(body_length)) {
+      LOG_ERROR("上传失败, 拷贝请求体失败, file_name=%s", file_name);
+      evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
+      return;
+    }
+
+    // 拼接普通存储路径。并且保存
+    const std::string real_path = Config::Instance().GetBackDir() + file_name;
+    if (!FileUtil::WriteFile(real_path, file_body)) {
+      LOG_ERROR("上传失败, 文件落盘失败, file_name=%s, real_path=%s", file_name, real_path.c_str());
+      evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
+      return;
+    }
+
+    FileMeta meta;
+    meta.is_packed_ = false;
+    meta.file_size_ = body_length;
+    meta.modify_time_ = std::time(nullptr);
+    meta.real_path_ = real_path;
+
+    if (!file_table_.Insert(file_name, meta)) {
+      file_table_.Update(file_name, meta);
+    }
+
+    LOG_INFO("上传成功, file_name=%s, store_type=%s, size=%zu, real_path=%s", file_name, store_type,
+             body_length, real_path.c_str());
+    SendTextResponse(request, "Upload Success");
+  }
 
   /*
       DownloadFile:
@@ -238,6 +310,44 @@ class Service {
   }
 
   /*
+      IsValidUploadFileName:
+
+      这里校验上传文件名是否可以直接拼到存储目录后面。当前先禁止空文件名、路径分隔
+      符和 ".."，避免客户端通过文件名把内容写到普通存储目录之外。
+  */
+  bool IsValidUploadFileName(const char* file_name) const {
+    if (file_name == nullptr || *file_name == '\0') {
+      return false;
+    }
+
+    std::string name(file_name);
+    //只允许 file_name 是一个单纯文件名 不允许它带目录 不允许它跳到上级目录
+    /*禁止：
+            ../a.txt
+            dir/a.txt
+            dir\a.txt
+            ../../evil.txt
+    */
+    return name.find('/') == std::string::npos && name.find('\\') == std::string::npos &&
+           name.find("..") == std::string::npos;
+  }
+
+  /*
+      IsValidStoreType:
+
+      这里校验客户端传入的存储类型。当前第一版还没有接压缩库，所以 deep 和 low 都会
+      先按普通存储落盘，但请求头本身必须是约定好的值。
+  */
+  bool IsValidStoreType(const char* store_type) const {
+    if (store_type == nullptr) {
+      return false;
+    }
+
+    std::string type(store_type);
+    return type == "deep" || type == "low";
+  }
+
+  /*
       Cleanup:
 
       这里释放当前 Service 持有的 libevent 资源。它会销毁 HTTP 服务对象和事件底
@@ -268,4 +378,7 @@ class Service {
   // 保存监听地址和端口，便于启动日志和后续诊断。
   std::string address_ = "0.0.0.0";
   uint16_t port_ = 8080;
+
+  // file_table_ 保存当前服务已经接收的文件元数据。
+  FileTable file_table_;
 };
