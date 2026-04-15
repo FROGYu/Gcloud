@@ -5,11 +5,14 @@
 #include "Net/Server/Data/FileMeta.hpp"
 #include "Net/Server/Data/FileTable.hpp"
 #include "Util/FileUtil.hpp"
+#include "Util/UniqueFd.hpp"
 
 #include <event2/buffer.h>
 #include <event2/event.h>
 #include <event2/http.h>
 
+#include <fcntl.h>
+#include <unistd.h>
 #include <chrono>
 #include <cstdint>
 #include <ctime>
@@ -167,7 +170,8 @@ class Service {
       GetMainPage(request);
     } else if (command == EVHTTP_REQ_POST && request_path == "/upload") {
       UploadFile(request);
-    } else if (command == EVHTTP_REQ_GET && request_path.rfind("/download/", 0) == 0) {
+    } else if (command == EVHTTP_REQ_GET &&
+               request_path.rfind(Config::Instance().GetDownloadPrefix(), 0) == 0) {
       DownloadFile(request);
     } else {
       LOG_ERROR("未匹配到路由, method=%s, path=%s", method_name, request_path.c_str());
@@ -269,10 +273,66 @@ class Service {
   /*
       DownloadFile:
 
-      这是下载路由的占位处理函数。当前先返回一段简单文本，用来确认下载请求
-      已经能够被正确分发到这里，后面再继续接入真实的文件下载逻辑。
+      这里处理普通文件下载。它先从下载路径中取出文件名，再从 FileTable 查询文件
+      元数据，最后通过 evbuffer_add_file 把文件描述符挂到响应缓冲区，避免把大文件
+      读进用户态内存。
   */
-  void DownloadFile(evhttp_request* request) { SendTextResponse(request, "download"); }
+  void DownloadFile(evhttp_request* request) {
+    std::string filename;
+    if (!ParseDownloadFileName(request, &filename)) {
+      LOG_ERROR("下载失败, 解析下载文件名失败");
+      evhttp_send_error(request, HTTP_BADREQUEST, "Bad Request");
+      return;
+    }
+
+    FileMeta meta;
+    if (!file_table_.Get(filename, &meta)) {
+      LOG_ERROR("下载失败, 文件不存在, file_name=%s", filename.c_str());
+      evhttp_send_error(request, HTTP_NOTFOUND, "File Not Found");
+      return;
+    }
+
+    // open: 打开磁盘上的真实文件，拿到底层文件描述符交给 libevent 做零拷贝发送。
+    UniqueFd file_fd(::open(meta.real_path_.c_str(), O_RDONLY));
+    if (!file_fd.valid()) {
+      LOG_ERROR("下载失败, 打开文件失败, file_name=%s, real_path=%s", filename.c_str(),
+                meta.real_path_.c_str());
+      evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
+      return;
+    }
+
+    // evbuffer_new: 创建响应体缓冲区，后面把文件描述符挂到这个 buffer 上。
+    evbuffer* buffer = evbuffer_new();
+    if (buffer == nullptr) {
+      LOG_ERROR("下载失败, 创建响应缓冲区失败, file_name=%s", filename.c_str());
+      evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
+      return;
+    }
+
+    // evbuffer_add_file: 把 fd 对应文件加入响应缓冲区，libevent 会接管并在发送后关闭 fd。
+    //把已经打开的文件，挂到响应缓冲区 buffer 上，准备发给客户端。
+    if (evbuffer_add_file(buffer, file_fd.get(), 0, static_cast<ev_off_t>(meta.file_size_)) != 0) {
+      LOG_ERROR("下载失败, 挂载文件到响应缓冲区失败, file_name=%s", filename.c_str());
+      evbuffer_free(buffer);
+      evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
+      return;
+    }
+
+    // evbuffer_add_file 成功后 fd 已经交给 libevent，UniqueFd 不能再负责关闭它。
+    file_fd.release();
+
+    evkeyvalq* output_headers = evhttp_request_get_output_headers(request);
+    if (output_headers != nullptr) {
+      evhttp_add_header(output_headers, "Content-Type", "application/octet-stream");
+      std::string disposition = "attachment; filename=\"" + filename + "\"";
+      evhttp_add_header(output_headers, "Content-Disposition", disposition.c_str());
+    }
+
+    LOG_INFO("下载成功, file_name=%s, size=%zu, real_path=%s", filename.c_str(), meta.file_size_,
+             meta.real_path_.c_str());
+    evhttp_send_reply(request, HTTP_OK, "OK", buffer);
+    evbuffer_free(buffer);
+  }
 
   /*
       SendTextResponse:
@@ -346,6 +406,40 @@ class Service {
 
     std::string type(store_type);
     return type == "deep" || type == "low";
+  }
+
+  /*
+      ParseDownloadFileName:
+
+      这里从下载请求的 URI 中提取文件名。它会重新解析 URI，取出纯路径，然后去掉配置
+      中的下载前缀，得到真正要查 FileTable 的文件名。
+  */
+  bool ParseDownloadFileName(evhttp_request* request, std::string* filename) const {
+    if (filename == nullptr) {
+      return false;
+    }
+
+    const char* uri = evhttp_request_get_uri(request);
+    if (uri == nullptr) {
+      return false;
+    }
+
+    evhttp_uri* decoded_uri = evhttp_uri_parse(uri);
+    if (decoded_uri == nullptr) {
+      return false;
+    }
+
+    const char* path = evhttp_uri_get_path(decoded_uri);
+    std::string request_path = (path == nullptr || *path == '\0') ? "/" : path;
+    evhttp_uri_free(decoded_uri);
+
+    const std::string& prefix = Config::Instance().GetDownloadPrefix();
+    if (request_path.rfind(prefix, 0) != 0) {
+      return false;
+    }
+
+    *filename = request_path.substr(prefix.size());
+    return IsValidUploadFileName(filename->c_str());
   }
 
   /*
