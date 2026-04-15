@@ -39,6 +39,8 @@ class Config {
   const std::string& GetBackDir() const { return back_dir_; }
   // 返回元数据备份文件路径。
   const std::string& GetBackupFile() const { return backup_file_; }
+  // 返回主页 HTML 模板文件路径。
+  const std::string& GetIndexTemplateFile() const { return index_template_file_; }
 
   // 修改服务端监听端口。
   void SetServerPort(uint16_t server_port) { server_port_ = server_port; }
@@ -54,6 +56,10 @@ class Config {
   void SetBackDir(const std::string& back_dir) { back_dir_ = back_dir; }
   // 修改元数据备份文件路径。
   void SetBackupFile(const std::string& backup_file) { backup_file_ = backup_file; }
+  // 修改主页 HTML 模板文件路径。
+  void SetIndexTemplateFile(const std::string& index_template_file) {
+    index_template_file_ = index_template_file;
+  }
 
  private:
   /*
@@ -83,4 +89,7 @@ class Config {
 
   // backup_file_ 保存元数据备份文件的默认路径。
   std::string backup_file_ = "./backup.json";
+
+  // index_template_file_ 保存主页 HTML 模板文件路径。
+  std::string index_template_file_ = "src/Net/Server/Web/index.html";
 };
