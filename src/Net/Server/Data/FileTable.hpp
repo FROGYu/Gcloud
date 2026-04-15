@@ -86,6 +86,18 @@ class FileTable {
   */
   void Clear() { files_.clear(); }
 
+  // 这里预留把整张元数据表保存到备份文件的入口，后面接入 JSON 持久化时再补实现。
+  bool Store(const std::string& backup_file) const {
+    (void)backup_file;
+    return false;
+  }
+
+  // 这里预留从备份文件恢复整张元数据表的入口，后面接入 JSON 反序列化时再补实现。
+  bool Load(const std::string& backup_file) {
+    (void)backup_file;
+    return false;
+  }
+
  private:
   // files_ 保存“文件名 -> 文件元数据”的对应关系。
   std::unordered_map<std::string, FileMeta> files_;
