@@ -2,6 +2,8 @@
 
 #include "Net/Server/Data/FileMeta.hpp"
 
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 
@@ -21,6 +23,7 @@ class FileTable {
       已有记录静默覆盖掉。
   */
   bool Insert(const std::string& filename, const FileMeta& meta) {
+    std::unique_lock<std::shared_mutex> lock(rw_lock_);
     auto [it, inserted] = files_.emplace(filename, meta);
     return inserted;
   }
@@ -30,6 +33,7 @@ class FileTable {
       命中任何旧记录。
   */
   bool Update(const std::string& filename, const FileMeta& meta) {
+    std::unique_lock<std::shared_mutex> lock(rw_lock_);
     auto it = files_.find(filename);
     if (it == files_.end()) {
       return false;
@@ -43,6 +47,7 @@ class FileTable {
       这里按文件名查询一条记录。查到后把结果写进 meta，查不到就返回 false。
   */
   bool Get(const std::string& filename, FileMeta* meta) const {
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
     if (meta == nullptr) {
       return false;
     }
@@ -61,6 +66,7 @@ class FileTable {
       断结果。
   */
   bool Exists(const std::string& filename) const {
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
     return files_.find(filename) != files_.end();
   }
 
@@ -68,32 +74,45 @@ class FileTable {
       这里按文件名删除一条记录。删到返回 true，目标不存在返回 false。
   */
   bool Remove(const std::string& filename) {
+    std::unique_lock<std::shared_mutex> lock(rw_lock_);
     return files_.erase(filename) > 0;
   }
 
   /*
-      这里返回整张元数据表的只读引用。后面主页展示文件列表时，可以直接遍历这张表。
+      这里返回整张元数据表的快照副本。因为内部已经加了读写锁，如果直接把内部 map
+      的引用返回出去，函数结束后锁会释放，外面继续用这份引用就不安全了。
   */
-  const std::unordered_map<std::string, FileMeta>& All() const { return files_; }
+  std::unordered_map<std::string, FileMeta> All() const {
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    return files_;
+  }
 
   /*
       这里返回当前元数据表里一共有多少条文件记录。
   */
-  size_t Size() const { return files_.size(); }
+  size_t Size() const {
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    return files_.size();
+  }
 
   /*
       这里清空整张元数据表。后面做元数据恢复、测试重置或重新加载时都可能会用到。
   */
-  void Clear() { files_.clear(); }
+  void Clear() {
+    std::unique_lock<std::shared_mutex> lock(rw_lock_);
+    files_.clear();
+  }
 
   // 这里预留把整张元数据表保存到备份文件的入口，后面接入 JSON 持久化时再补实现。
   bool Store(const std::string& backup_file) const {
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
     (void)backup_file;
     return false;
   }
 
   // 这里预留从备份文件恢复整张元数据表的入口，后面接入 JSON 反序列化时再补实现。
   bool Load(const std::string& backup_file) {
+    std::unique_lock<std::shared_mutex> lock(rw_lock_);
     (void)backup_file;
     return false;
   }
@@ -101,4 +120,7 @@ class FileTable {
  private:
   // files_ 保存“文件名 -> 文件元数据”的对应关系。
   std::unordered_map<std::string, FileMeta> files_;
+
+  // rw_lock_ 保护 files_，后面网络线程读、后台线程写时都要先经过这把读写锁。
+  mutable std::shared_mutex rw_lock_; //mutable允许这个成员在 const 函数里也能改
 };
