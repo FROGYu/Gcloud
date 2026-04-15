@@ -250,11 +250,12 @@ class Service {
       return;
     }
 
-    FileMeta meta;
-    meta.is_packed_ = false;
-    meta.file_size_ = body_length;
-    meta.modify_time_ = std::time(nullptr);
-    meta.real_path_ = real_path;
+    FileMeta meta{
+        .is_packed_ = false,
+        .file_size_ = body_length,
+        .modify_time_ = std::time(nullptr),
+        .real_path_ = real_path,
+    };
 
     if (!file_table_.Insert(file_name, meta)) {
       file_table_.Update(file_name, meta);
