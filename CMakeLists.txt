@@ -47,15 +47,15 @@ add_executable(epoll_server
 )
 gcloud_configure_target(epoll_server)
 
-# 外部动态库配置。jsoncpp 先保留给旧代码，后续持久化切到 nlohmann/json 后可以删除。
+# 外部动态库配置。nlohmann/json 是头文件库，zstd 和 libevent 需要链接系统库。
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(JSONCPP REQUIRED jsoncpp)
+pkg_check_modules(ZSTD REQUIRED libzstd)
 
 target_include_directories(${PROJECT_NAME} PRIVATE
-    ${JSONCPP_INCLUDE_DIRS}
+    ${ZSTD_INCLUDE_DIRS}
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
-    ${JSONCPP_LIBRARIES}
+    ${ZSTD_LIBRARIES}
     event
 )
