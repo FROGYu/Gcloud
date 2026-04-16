@@ -1,6 +1,9 @@
 #pragma once
 
 #include "Net/Server/Data/FileMeta.hpp"
+#include "Util/FileUtil.hpp"
+
+#include <nlohmann/json.hpp>
 
 #include <mutex>
 #include <shared_mutex>
@@ -103,11 +106,38 @@ class FileTable {
     files_.clear();
   }
 
-  // 这里预留把整张元数据表保存到备份文件的入口，后面接入 JSON 持久化时再补实现。
+  // 这里把整张元数据表序列化成 JSON 文本，再整体写入备份文件。
   bool Store(const std::string& backup_file) const {
-    std::shared_lock<std::shared_mutex> lock(rw_lock_);
-    (void)backup_file;
-    return false;
+    if (backup_file.empty()) {
+      return false;
+    }
+
+    nlohmann::json root;
+    {
+      /*因为 files_ 可能被上传线程或后续后台线程同时修改，遍历时必须先用读锁把它保护住，
+      但我又不想把锁持有到磁盘写入阶段，所以我选择“加读锁读表组 JSON，锁外再落盘”。*/
+      std::shared_lock<std::shared_mutex> lock(rw_lock_);
+
+      // json::array() 明确告诉库：这里要构造的是 JSON 数组，不是 JSON 对象。
+      root = nlohmann::json::array();
+      for (const auto& [filename, meta] : files_) {
+        nlohmann::json item;
+
+        // 这里就是按“字段名 -> 字段值”的方式给 JSON 对象逐项赋值。
+        item["filename"] = filename;
+        item["is_packed"] = meta.is_packed_;
+        item["file_size"] = meta.file_size_;
+        item["modify_time"] = meta.modify_time_;
+        item["real_path"] = meta.real_path_;
+
+        // push_back 会把当前这一条文件记录追加到 JSON 数组末尾。
+        root.push_back(item);
+      }
+    }
+
+    // dump(4) 会把 JSON 序列化成字符串，4 表示每一级缩进 4 个空格，便于人读。
+    const std::string backup_body = root.dump(4);
+    return FileUtil::WriteFile(backup_file, backup_body);
   }
 
   // 这里预留从备份文件恢复整张元数据表的入口，后面接入 JSON 反序列化时再补实现。
@@ -122,5 +152,5 @@ class FileTable {
   std::unordered_map<std::string, FileMeta> files_;
 
   // rw_lock_ 保护 files_，后面网络线程读、后台线程写时都要先经过这把读写锁。
-  mutable std::shared_mutex rw_lock_; //mutable允许这个成员在 const 函数里也能改
+  mutable std::shared_mutex rw_lock_;  //mutable允许这个成员在 const 函数里也能改
 };
