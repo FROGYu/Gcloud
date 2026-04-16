@@ -6,6 +6,7 @@
 #include "Net/Server/Data/FileTable.hpp"
 #include "Util/FileUtil.hpp"
 #include "Util/HttpRange.hpp"
+#include "Util/ThreadPool.hpp"
 #include "Util/TimeUtil.hpp"
 #include "Util/UniqueFd.hpp"
 #include "Util/ZstdUtil.hpp"
@@ -79,8 +80,8 @@ class Service {
     }
 
     // event_new: 把 notify_fd_ 包成 libevent 事件，后面只要这个 fd 可读就会回调。
-    notify_event_ = event_new(base_, notify_fd_, EV_READ | EV_PERSIST, &Service::OnNotifyFdRead,
-                              this);
+    notify_event_ =
+        event_new(base_, notify_fd_, EV_READ | EV_PERSIST, &Service::OnNotifyFdRead, this);
     if (notify_event_ == nullptr) {
       LOG_ERROR("创建 eventfd 监听事件失败");
       Cleanup();
@@ -177,6 +178,24 @@ class Service {
   }
 
   /*
+      OnAsyncRequestComplete:
+
+      这里处理“异步持有的 request 已经完成回包”的收尾动作。因为 deep 上传会把
+      request 的生命周期延长到后台任务结束后，所以真正写完响应后要在这里显式释放。
+      供evhttp_request_set_on_complete_cb使用的响应完成的处理函数
+  */
+  static void OnAsyncRequestComplete(evhttp_request* request, void* arg) {
+    (void)arg;
+
+    // evhttp_request_is_owned: 判断这个 request 的生命周期是不是已经被我们手动接管了。
+    // 只有调用过 evhttp_request_own 的 request，才应该在这里由我们自己释放。
+    if (request != nullptr && evhttp_request_is_owned(request)) {
+      // evhttp_request_free: 释放被 own 过的 request，结束这次异步请求的生命周期。
+      evhttp_request_free(request);
+    }
+  }
+
+  /*
       HandleRequest:
 
       这里执行真正的对 request 处理逻辑。当前这一步先根据请求方法和路径做路由
@@ -260,11 +279,41 @@ class Service {
     size_t queue_size = 0;
     {
       std::lock_guard<std::mutex> lock(completed_mutex_);
-      queue_size = completed_requests_.size();
+      queue_size = completed_results_.size();
     }
 
     LOG_INFO("收到后台完成通知, ready_count=%llu, completed_queue_size=%zu",
              static_cast<unsigned long long>(ready_count), queue_size);
+
+    while (true) {
+      CompletedResult result;
+
+      {
+        std::lock_guard<std::mutex> lock(completed_mutex_);
+        // eventfd 一次可读可能对应多个后台任务完成，这里要把当前积压的结果都取干净。
+        if (completed_results_.empty()) {
+          break;
+        }
+
+        // 这里一次性取出“该给谁回包”和“要回什么结果”，主线程后面不需要再额外查表。
+        result = std::move(completed_results_.front());
+        completed_results_.pop();
+      }
+
+      if (result.request_ == nullptr) {
+        continue;
+      }
+
+      // 真正的 HTTP 回包必须回到 libevent 主线程执行，不能让后台线程直接碰 request。
+      if (result.success_) {
+        SendTextResponse(result.request_,
+                         result.message_.empty() ? "Upload Success" : result.message_);
+      } else {
+        evhttp_send_error(result.request_, HTTP_INTERNAL,
+                          result.message_.empty() ? "Internal Server Error"
+                                                  : result.message_.c_str());
+      }
+    }
   }
 
   /*
@@ -393,23 +442,34 @@ class Service {
         return;
       }
     } else {
-      // deep 表示深度存储，先把原始正文压缩，再落到 packdir。
-      std::string packed_body;
-      if (!ZstdUtil::Compress(file_body, &packed_body)) {
-        LOG_ERROR("上传失败, 压缩文件失败, file_name=%s", file_name);
+      // deep 走异步路径：主线程只负责收完请求体并把任务扔给线程池，不再同步压缩和写盘。
+      const std::string file_name_str(file_name);
+
+      // evhttp_request_set_on_complete_cb: 给 request 注册“响应真正发完之后”的收尾回调。
+      // deep 上传不会在当前栈帧里立刻回包，所以要把释放动作延后到异步回包完成之后。
+      evhttp_request_set_on_complete_cb(request, &Service::OnAsyncRequestComplete, this);
+
+      // evhttp_request_own: 把 request 的生命周期从 libevent 默认流程里接管出来。
+      // 这样 UploadFile 当前 return 之后，request 也不会立刻被 libevent 回收。
+      evhttp_request_own(request);
+
+      // Enqueue: 把 deep 上传后续的重任务提交给线程池。主线程到这里不再继续压缩和写盘，
+      // 只负责把当前请求需要的数据按值带进 lambda，交给后台线程慢慢处理。
+      // this: 后台线程后面还要回调当前 Service 的成员函数。
+      // file_body: 这次上传的原始文件正文，后台线程压缩时直接用它。
+      // file_name_str: 这次上传的文件名，后台线程后面要拿它拼压缩文件路径和更新元数据。
+      // request: 当前 HTTP 请求对象，后台线程做完后要靠它通知主线程“该给谁回包”。
+      if (!thread_pool_.Enqueue([this, file_body, file_name_str, request]() {
+            this->HandleAsyncDeepUpload(file_body, file_name_str, request);
+          })) {
+        LOG_ERROR("上传失败, 异步任务入队失败, file_name=%s", file_name);
         evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
         return;
       }
 
-      real_path = Config::Instance().GetPackDir() + file_name + Config::Instance().GetPackfileSuffix();
-      if (!FileUtil::WriteFile(real_path, packed_body)) {
-        LOG_ERROR("上传失败, 压缩文件落盘失败, file_name=%s, real_path=%s", file_name,
-                  real_path.c_str());
-        evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
-        return;
-      }
-
-      is_packed = true;
+      LOG_INFO("上传任务已异步提交, file_name=%s, store_type=%s, size=%zu", file_name, store_type,
+               body_length);
+      return;
     }
 
     FileMeta meta{
@@ -436,6 +496,72 @@ class Service {
     LOG_INFO("上传成功, file_name=%s, store_type=%s, size=%zu, real_path=%s", file_name, store_type,
              body_length, real_path.c_str());
     SendTextResponse(request, "Upload Success");
+  }
+
+  /*
+      HandleAsyncDeepUpload:
+
+      这里运行在后台线程里，专门负责 deep 上传的重任务：压缩、写压缩文件、更新元
+      数据并持久化。任务做完后，它不会直接回 HTTP 响应，而是把结果塞进完成队列，
+      再通过 eventfd 唤醒主线程。
+  */
+  void HandleAsyncDeepUpload(const std::string& file_body, const std::string& file_name,
+                             evhttp_request* request) {
+    bool success = false;
+    std::string message = "Internal Server Error";
+
+    do {
+      std::string packed_body;
+      if (!ZstdUtil::Compress(file_body, &packed_body)) {
+        LOG_ERROR("异步上传失败, 压缩文件失败, file_name=%s", file_name.c_str());
+        message = "Compress Failed";
+        break;
+      }
+
+      const std::string real_path =
+          Config::Instance().GetPackDir() + file_name + Config::Instance().GetPackfileSuffix();
+      if (!FileUtil::WriteFile(real_path, packed_body)) {
+        LOG_ERROR("异步上传失败, 压缩文件写入失败, file_name=%s, real_path=%s", file_name.c_str(),
+                  real_path.c_str());
+        message = "Write File Failed";
+        break;
+      }
+
+      FileMeta meta{
+          .is_packed_ = true,
+          .file_size_ = file_body.size(),
+          .modify_time_ = std::time(nullptr),
+          .real_path_ = real_path,
+      };
+
+      if (!file_table_.Insert(file_name, meta)) {
+        file_table_.Update(file_name, meta);
+      }
+
+      const std::string& backup_file = Config::Instance().GetBackupFile();
+      if (!file_table_.Store(backup_file)) {
+        LOG_ERROR("异步上传失败, 元数据持久化失败, file_name=%s, backup_file=%s", file_name.c_str(),
+                  backup_file.c_str());
+        message = "Store Metadata Failed";
+        break;
+      }
+
+      success = true;
+      message = "Upload Success";
+    } while (false);
+
+    {
+      std::lock_guard<std::mutex> lock(completed_mutex_);
+      // 这里直接把 request 和它最终的处理结果打包进同一个完成队列，方便主线程顺序回包。
+      completed_results_.push(
+          CompletedResult{.request_ = request, .success_ = success, .message_ = message});
+    }
+
+    uint64_t one = 1;
+    // 往 eventfd 写 1 相当于告诉主线程：“完成队列里新到了一份结果，起来处理”。
+    if (::write(notify_fd_, &one, sizeof(one)) != static_cast<ssize_t>(sizeof(one))) {
+      LOG_ERROR("异步上传失败, 唤醒主线程失败, file_name=%s", file_name.c_str());
+    }
   }
 
   /*
@@ -565,8 +691,8 @@ class Service {
 
       if (is_partial) {
         // Content-Range 用来明确告诉客户端：这次返回的是整个文件中的哪一段。
-        std::string content_range = "bytes " + std::to_string(start) + "-" +
-                                    std::to_string(end) + "/" + std::to_string(meta.file_size_);
+        std::string content_range = "bytes " + std::to_string(start) + "-" + std::to_string(end) +
+                                    "/" + std::to_string(meta.file_size_);
         evhttp_add_header(output_headers, "Content-Range", content_range.c_str());
       }
     }
@@ -795,9 +921,25 @@ class Service {
   // file_table_ 保存当前服务已经接收的文件元数据。
   FileTable file_table_;
 
-  // completed_requests_ 保存已经完成后台处理、等待主线程回响应的请求队列。
-  std::queue<evhttp_request*> completed_requests_;
+  // thread_pool_ 负责执行 deep 上传里的压缩、写盘和持久化这类后台任务。
+  ThreadPool thread_pool_;
 
-  // completed_mutex_ 保护 completed_requests_，避免主线程和后台线程并发访问冲突。
+  /*
+      CompletedResult:
+
+      这是异步上传任务回到主线程时携带的结果单元。后台线程完成压缩和持久化后，会把
+      “该给哪个 request 回包、回成功还是失败、附带什么提示信息” 一次性打包进这个
+      结构，再塞进完成队列交给主线程处理。
+  */
+  struct CompletedResult {
+    evhttp_request* request_ = nullptr;  // 指向这次异步上传对应的 HTTP 请求，主线程后面靠它回包。
+    bool success_ = false;               // 标记后台任务最终是成功还是失败。
+    std::string message_;                // 保存要返回给客户端的提示信息或错误原因。
+  };
+
+  // completed_results_ 保存已经完成后台处理的异步请求结果，主线程被唤醒后按队列顺序回包。
+  std::queue<CompletedResult> completed_results_;
+
+  // completed_mutex_ 保护异步完成结果队列，避免主线程和后台线程并发访问冲突。
   std::mutex completed_mutex_;
 };
