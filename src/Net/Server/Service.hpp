@@ -5,6 +5,7 @@
 #include "Net/Server/Data/FileMeta.hpp"
 #include "Net/Server/Data/FileTable.hpp"
 #include "Util/FileUtil.hpp"
+#include "Util/HttpRange.hpp"
 #include "Util/TimeUtil.hpp"
 #include "Util/UniqueFd.hpp"
 #include "Util/ZstdUtil.hpp"
@@ -397,6 +398,28 @@ class Service {
       return;
     }
 
+    // evhttp_request_get_input_headers: 取出客户端这次下载请求附带的请求头容器。
+    evkeyvalq* input_headers = evhttp_request_get_input_headers(request);
+
+    // evhttp_find_header: 在请求头里查找 Range 字段，看看客户端是不是在发起断点续传请求。
+    const char* range_str =
+        (input_headers == nullptr) ? nullptr : evhttp_find_header(input_headers, "Range");
+
+    size_t start = 0;
+    size_t end = meta.file_size_ - 1;
+    bool is_partial = false;
+    if (range_str != nullptr) {
+      // ParseRange 会把 "bytes=100-200" 这类字符串解析成实际字节区间。
+      if (!HttpRange::ParseRange(range_str, meta.file_size_, &start, &end)) {
+        LOG_ERROR("下载失败, Range 非法, file_name=%s, range=%s", filename.c_str(), range_str);
+        evbuffer_free(buffer);
+        evhttp_send_error(request, 416, "Requested Range Not Satisfiable");
+        return;
+      }
+
+      is_partial = true;
+    }
+
     if (!meta.is_packed_) {
       // open: 打开磁盘上的真实文件，拿到底层文件描述符交给 libevent 做零拷贝发送。
       UniqueFd file_fd(::open(meta.real_path_.c_str(), O_RDONLY));
@@ -410,8 +433,8 @@ class Service {
 
       // evbuffer_add_file: 把 fd 对应文件加入响应缓冲区，libevent 会接管并在发送后关闭 fd。
       // 把已经打开的文件挂到响应缓冲区上，后续发送时可以直接走零拷贝。
-      if (evbuffer_add_file(buffer, file_fd.get(), 0,
-                            static_cast<ev_off_t>(meta.file_size_)) != 0) {
+      if (evbuffer_add_file(buffer, file_fd.get(), static_cast<ev_off_t>(start),
+                            static_cast<ev_off_t>(end - start + 1)) != 0) {
         LOG_ERROR("下载失败, 挂载文件到响应缓冲区失败, file_name=%s", filename.c_str());
         evbuffer_free(buffer);
         evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
@@ -449,7 +472,7 @@ class Service {
       }
 
       // evbuffer_add 会把内存里的正文拷贝进响应缓冲区，适合发送解压后的字符串数据。
-      if (evbuffer_add(buffer, file_body.data(), file_body.size()) != 0) {
+      if (evbuffer_add(buffer, file_body.data() + start, end - start + 1) != 0) {
         LOG_ERROR("下载失败, 写入解压后的响应正文失败, file_name=%s", filename.c_str());
         evbuffer_free(buffer);
         evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
@@ -464,8 +487,9 @@ class Service {
       evhttp_add_header(output_headers, "Content-Disposition", disposition.c_str());
     }
 
-    LOG_INFO("下载成功, file_name=%s, size=%zu, packed=%d, real_path=%s", filename.c_str(),
-             meta.file_size_, static_cast<int>(meta.is_packed_), meta.real_path_.c_str());
+    LOG_INFO("下载成功, file_name=%s, start=%zu, end=%zu, partial=%d, packed=%d, real_path=%s",
+             filename.c_str(), start, end, static_cast<int>(is_partial),
+             static_cast<int>(meta.is_packed_), meta.real_path_.c_str());
     evhttp_send_reply(request, HTTP_OK, "OK", buffer);
     evbuffer_free(buffer);
   }
