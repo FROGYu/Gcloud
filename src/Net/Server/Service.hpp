@@ -370,9 +370,9 @@ class Service {
   /*
       DownloadFile:
 
-      这里处理普通文件下载。它先从下载路径中取出文件名，再从 FileTable 查询文件
-      元数据，最后通过 evbuffer_add_file 把文件描述符挂到响应缓冲区，避免把大文件
-      读进用户态内存。
+      这里处理文件下载。它先从下载路径中取出文件名，再从 FileTable 查询文件元数
+      据。普通文件继续走 evbuffer_add_file 零拷贝发送；压缩存储的文件会先整体读
+      出并解压，再把解压后的正文写回响应缓冲区。
   */
   void DownloadFile(evhttp_request* request) {
     std::string filename;
@@ -389,15 +389,6 @@ class Service {
       return;
     }
 
-    // open: 打开磁盘上的真实文件，拿到底层文件描述符交给 libevent 做零拷贝发送。
-    UniqueFd file_fd(::open(meta.real_path_.c_str(), O_RDONLY));
-    if (!file_fd.valid()) {
-      LOG_ERROR("下载失败, 打开文件失败, file_name=%s, real_path=%s", filename.c_str(),
-                meta.real_path_.c_str());
-      evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
-      return;
-    }
-
     // evbuffer_new: 创建响应体缓冲区，后面把文件描述符挂到这个 buffer 上。
     evbuffer* buffer = evbuffer_new();
     if (buffer == nullptr) {
@@ -406,17 +397,65 @@ class Service {
       return;
     }
 
-    // evbuffer_add_file: 把 fd 对应文件加入响应缓冲区，libevent 会接管并在发送后关闭 fd。
-    //把已经打开的文件，挂到响应缓冲区 buffer 上，准备发给客户端。
-    if (evbuffer_add_file(buffer, file_fd.get(), 0, static_cast<ev_off_t>(meta.file_size_)) != 0) {
-      LOG_ERROR("下载失败, 挂载文件到响应缓冲区失败, file_name=%s", filename.c_str());
-      evbuffer_free(buffer);
-      evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
-      return;
-    }
+    if (!meta.is_packed_) {
+      // open: 打开磁盘上的真实文件，拿到底层文件描述符交给 libevent 做零拷贝发送。
+      UniqueFd file_fd(::open(meta.real_path_.c_str(), O_RDONLY));
+      if (!file_fd.valid()) {
+        LOG_ERROR("下载失败, 打开文件失败, file_name=%s, real_path=%s", filename.c_str(),
+                  meta.real_path_.c_str());
+        evbuffer_free(buffer);
+        evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
+        return;
+      }
 
-    // evbuffer_add_file 成功后 fd 已经交给 libevent，UniqueFd 不能再负责关闭它。
-    file_fd.release();
+      // evbuffer_add_file: 把 fd 对应文件加入响应缓冲区，libevent 会接管并在发送后关闭 fd。
+      // 把已经打开的文件挂到响应缓冲区上，后续发送时可以直接走零拷贝。
+      if (evbuffer_add_file(buffer, file_fd.get(), 0,
+                            static_cast<ev_off_t>(meta.file_size_)) != 0) {
+        LOG_ERROR("下载失败, 挂载文件到响应缓冲区失败, file_name=%s", filename.c_str());
+        evbuffer_free(buffer);
+        evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
+        return;
+      }
+
+      // evbuffer_add_file 成功后 fd 已经交给 libevent，UniqueFd 不能再负责关闭它。
+      file_fd.release();
+    } else {
+      std::string packed_body;
+      if (!FileUtil::ReadFile(meta.real_path_, &packed_body)) {
+        LOG_ERROR("下载失败, 读取压缩文件失败, file_name=%s, real_path=%s", filename.c_str(),
+                  meta.real_path_.c_str());
+        evbuffer_free(buffer);
+        evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
+        return;
+      }
+
+      std::string file_body;
+      if (!ZstdUtil::Decompress(packed_body, &file_body)) {
+        LOG_ERROR("下载失败, 解压文件失败, file_name=%s, real_path=%s", filename.c_str(),
+                  meta.real_path_.c_str());
+        evbuffer_free(buffer);
+        evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
+        return;
+      }
+
+      // 元数据里记录的是原始大小，这里顺手校验一下，避免压缩文件损坏后把错误内容返回给客户端。
+      if (file_body.size() != meta.file_size_) {
+        LOG_ERROR("下载失败, 解压后大小异常, file_name=%s, expect=%zu, actual=%zu",
+                  filename.c_str(), meta.file_size_, file_body.size());
+        evbuffer_free(buffer);
+        evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
+        return;
+      }
+
+      // evbuffer_add 会把内存里的正文拷贝进响应缓冲区，适合发送解压后的字符串数据。
+      if (evbuffer_add(buffer, file_body.data(), file_body.size()) != 0) {
+        LOG_ERROR("下载失败, 写入解压后的响应正文失败, file_name=%s", filename.c_str());
+        evbuffer_free(buffer);
+        evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
+        return;
+      }
+    }
 
     evkeyvalq* output_headers = evhttp_request_get_output_headers(request);
     if (output_headers != nullptr) {
@@ -425,8 +464,8 @@ class Service {
       evhttp_add_header(output_headers, "Content-Disposition", disposition.c_str());
     }
 
-    LOG_INFO("下载成功, file_name=%s, size=%zu, real_path=%s", filename.c_str(), meta.file_size_,
-             meta.real_path_.c_str());
+    LOG_INFO("下载成功, file_name=%s, size=%zu, packed=%d, real_path=%s", filename.c_str(),
+             meta.file_size_, static_cast<int>(meta.is_packed_), meta.real_path_.c_str());
     evhttp_send_reply(request, HTTP_OK, "OK", buffer);
     evbuffer_free(buffer);
   }
