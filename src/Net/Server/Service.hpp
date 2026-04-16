@@ -15,10 +15,13 @@
 #include <event2/http.h>
 
 #include <fcntl.h>
+#include <sys/eventfd.h>
 #include <unistd.h>
 #include <chrono>
 #include <cstdint>
 #include <ctime>
+#include <mutex>
+#include <queue>
 #include <string>
 
 /*
@@ -66,6 +69,30 @@ class Service {
 
     // 注册统一请求入口，并把当前对象地址作为上下文一并交给 libevent 保存。
     evhttp_set_gencb(http_, &Service::HttpRequestCb, this);
+
+    // eventfd: 创建一个“跨线程通知计数器”，后台线程往里写，主线程就能被唤醒。
+    notify_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (notify_fd_ < 0) {
+      LOG_ERROR("创建 eventfd 失败");
+      Cleanup();
+      return false;
+    }
+
+    // event_new: 把 notify_fd_ 包成 libevent 事件，后面只要这个 fd 可读就会回调。
+    notify_event_ = event_new(base_, notify_fd_, EV_READ | EV_PERSIST, &Service::OnNotifyFdRead,
+                              this);
+    if (notify_event_ == nullptr) {
+      LOG_ERROR("创建 eventfd 监听事件失败");
+      Cleanup();
+      return false;
+    }
+
+    // event_add: 把 eventfd 监听事件正式挂到事件循环里。
+    if (event_add(notify_event_, nullptr) != 0) {
+      LOG_ERROR("注册 eventfd 监听事件失败");
+      Cleanup();
+      return false;
+    }
 
     // evhttp_bind_socket: 把 http_ 绑定到指定地址和端口上，开始对外监听。
     if (evhttp_bind_socket(http_, address_.c_str(), static_cast<uint16_t>(port_)) != 0) {
@@ -135,6 +162,21 @@ class Service {
   }
 
   /*
+      OnNotifyFdRead:
+
+      这是主线程监听 eventfd 的回调入口。后台线程把完成任务写进队列后，只需要往
+      eventfd 里写一个数字，libevent 就会唤醒主线程并进入这里。
+  */
+  static void OnNotifyFdRead(evutil_socket_t fd, short events, void* arg) {
+    Service* service = static_cast<Service*>(arg);
+    if (service == nullptr) {
+      return;
+    }
+
+    service->HandleNotifyFdRead(fd, events);
+  }
+
+  /*
       HandleRequest:
 
       这里执行真正的对 request 处理逻辑。当前这一步先根据请求方法和路径做路由
@@ -195,6 +237,34 @@ class Service {
         std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
     LOG_INFO("完成 HTTP 请求, method=%s, path=%s, cost_us=%lld", method_name, request_path.c_str(),
              static_cast<long long>(cost_us));
+  }
+
+  /*
+      HandleNotifyFdRead:
+
+      这里处理 eventfd 可读事件。当前这一步先把 eventfd 计数读空，确认后台线程确
+      实发来了完成通知，并记录当前完成队列里积压了多少个请求，后面再继续补“取队列
+      -> 回响应”的主线程逻辑。
+  */
+  void HandleNotifyFdRead(evutil_socket_t fd, short events) {
+    (void)events;
+
+    uint64_t ready_count = 0;
+    // eventfd 每次可读都必须把计数读出来，不然这个可读事件会一直重复触发。
+    ssize_t n = ::read(static_cast<int>(fd), &ready_count, sizeof(ready_count));
+    if (n != static_cast<ssize_t>(sizeof(ready_count))) {
+      LOG_ERROR("读取 eventfd 失败");
+      return;
+    }
+
+    size_t queue_size = 0;
+    {
+      std::lock_guard<std::mutex> lock(completed_mutex_);
+      queue_size = completed_requests_.size();
+    }
+
+    LOG_INFO("收到后台完成通知, ready_count=%llu, completed_queue_size=%zu",
+             static_cast<unsigned long long>(ready_count), queue_size);
   }
 
   /*
@@ -680,6 +750,18 @@ class Service {
   */
 
   void Cleanup() {
+    if (notify_event_ != nullptr) {
+      // event_free: 释放挂在 base_ 上的 eventfd 监听事件。
+      event_free(notify_event_);
+      notify_event_ = nullptr;
+    }
+
+    if (notify_fd_ >= 0) {
+      // close: 关闭跨线程通知用的 eventfd。
+      ::close(notify_fd_);
+      notify_fd_ = -1;
+    }
+
     if (http_ != nullptr) {
       // evhttp_free: 释放 HTTP 服务对象以及它内部持有的 HTTP 相关资源。
       evhttp_free(http_);
@@ -700,10 +782,22 @@ class Service {
   // http_ 负责把网络字节流解析成 HTTP 请求对象，供上层直接处理业务。
   evhttp* http_ = nullptr;
 
+  // notify_fd_ 是跨线程通知通道，后台线程写它来唤醒 libevent 主线程。
+  int notify_fd_ = -1;
+
+  // notify_event_ 是 notify_fd_ 对应的 libevent 监听事件。
+  event* notify_event_ = nullptr;
+
   // 保存监听地址和端口，便于启动日志和后续诊断。
   std::string address_ = "0.0.0.0";
   uint16_t port_ = 8080;
 
   // file_table_ 保存当前服务已经接收的文件元数据。
   FileTable file_table_;
+
+  // completed_requests_ 保存已经完成后台处理、等待主线程回响应的请求队列。
+  std::queue<evhttp_request*> completed_requests_;
+
+  // completed_mutex_ 保护 completed_requests_，避免主线程和后台线程并发访问冲突。
+  std::mutex completed_mutex_;
 };
