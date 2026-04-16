@@ -420,6 +420,9 @@ class Service {
       is_partial = true;
     }
 
+    // 这里统一算出本次真正要返回的字节数，后面普通文件和压缩文件都复用它。
+    const size_t length = end - start + 1;
+
     if (!meta.is_packed_) {
       // open: 打开磁盘上的真实文件，拿到底层文件描述符交给 libevent 做零拷贝发送。
       UniqueFd file_fd(::open(meta.real_path_.c_str(), O_RDONLY));
@@ -434,7 +437,7 @@ class Service {
       // evbuffer_add_file: 把 fd 对应文件加入响应缓冲区，libevent 会接管并在发送后关闭 fd。
       // 把已经打开的文件挂到响应缓冲区上，后续发送时可以直接走零拷贝。
       if (evbuffer_add_file(buffer, file_fd.get(), static_cast<ev_off_t>(start),
-                            static_cast<ev_off_t>(end - start + 1)) != 0) {
+                            static_cast<ev_off_t>(length)) != 0) {
         LOG_ERROR("下载失败, 挂载文件到响应缓冲区失败, file_name=%s", filename.c_str());
         evbuffer_free(buffer);
         evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
@@ -471,8 +474,8 @@ class Service {
         return;
       }
 
-      // evbuffer_add 会把内存里的正文拷贝进响应缓冲区，适合发送解压后的字符串数据。
-      if (evbuffer_add(buffer, file_body.data() + start, end - start + 1) != 0) {
+      // evbuffer_add 会把 [start, end] 这段内存拷贝进响应缓冲区，适合发送解压后的字符串数据。
+      if (evbuffer_add(buffer, file_body.data() + start, length) != 0) {
         LOG_ERROR("下载失败, 写入解压后的响应正文失败, file_name=%s", filename.c_str());
         evbuffer_free(buffer);
         evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
@@ -480,17 +483,34 @@ class Service {
       }
     }
 
+    // evkeyvalq 是 libevent 用来保存 HTTP 头字段的链表容器，这里拿到的是“响应头集合”。
     evkeyvalq* output_headers = evhttp_request_get_output_headers(request);
     if (output_headers != nullptr) {
+      // 告诉客户端：这次返回的是一段二进制文件数据，不要按文本或 HTML 去解释。
       evhttp_add_header(output_headers, "Content-Type", "application/octet-stream");
+
+      // attachment 表示按“下载附件”处理；filename 用来告诉浏览器默认保存文件名。
       std::string disposition = "attachment; filename=\"" + filename + "\"";
       evhttp_add_header(output_headers, "Content-Disposition", disposition.c_str());
+
+      if (is_partial) {
+        // Content-Range 用来明确告诉客户端：这次返回的是整个文件中的哪一段。
+        std::string content_range = "bytes " + std::to_string(start) + "-" +
+                                    std::to_string(end) + "/" + std::to_string(meta.file_size_);
+        evhttp_add_header(output_headers, "Content-Range", content_range.c_str());
+      }
     }
 
     LOG_INFO("下载成功, file_name=%s, start=%zu, end=%zu, partial=%d, packed=%d, real_path=%s",
              filename.c_str(), start, end, static_cast<int>(is_partial),
              static_cast<int>(meta.is_packed_), meta.real_path_.c_str());
-    evhttp_send_reply(request, HTTP_OK, "OK", buffer);
+
+    if (is_partial) {
+      // 206 表示本次返回的是文件的部分内容，浏览器和下载器会据此继续做断点续传。
+      evhttp_send_reply(request, 206, "Partial Content", buffer);
+    } else {
+      evhttp_send_reply(request, HTTP_OK, "OK", buffer);
+    }
     evbuffer_free(buffer);
   }
 
