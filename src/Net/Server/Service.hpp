@@ -5,6 +5,7 @@
 #include "Net/Server/Data/FileMeta.hpp"
 #include "Net/Server/Data/FileTable.hpp"
 #include "Util/FileUtil.hpp"
+#include "Util/TimeUtil.hpp"
 #include "Util/UniqueFd.hpp"
 
 #include <event2/buffer.h>
@@ -189,10 +190,63 @@ class Service {
   /*
       GetMainPage:
 
-      这是主页路由的占位处理函数。当前先返回一段简单文本，用来确认 GET /
-      已经能够被正确分发到这里，后面再替换成真正的网页内容。
+      这里处理主页展示。它先读取服务端 HTML 模板，再遍历 FileTable 快照生成文件
+      列表行，最后把列表内容替换进模板占位符并返回给浏览器渲染。
   */
-  void GetMainPage(evhttp_request* request) { SendTextResponse(request, "main page"); }
+  void GetMainPage(evhttp_request* request) {
+    std::string html_content;
+    const std::string& template_path = Config::Instance().GetIndexTemplateFile();
+    if (!FileUtil::ReadFile(template_path, &html_content)) {
+      LOG_ERROR("读取主页模板失败, path=%s", template_path.c_str());
+      evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
+      return;
+    }
+
+    // list_html 保存最终要塞进 {{FILE_LIST}} 占位符里的所有 <tr>...</tr> 行。
+    std::string list_html;
+
+    // All 返回的是 FileTable 的快照副本，后面拼 HTML 时不会继续占用 FileTable 的读锁。
+    auto files = file_table_.All();
+    if (files.empty()) {
+      // colspan="4" 表示这一格横跨四列，用一行提示当前没有任何文件。
+      list_html = "<tr><td colspan=\"4\">暂无文件</td></tr>";
+    } else {
+      for (const auto& [filename, meta] : files) {
+        // 文件名来自客户端，写进 HTML 前必须转义，避免破坏页面结构。
+        const std::string safe_filename = HtmlEscape(filename);
+
+        // href 属性里也要做 HTML 转义，避免特殊字符破坏属性边界。
+        const std::string safe_link = HtmlEscape(Config::Instance().GetDownloadPrefix() + filename);
+
+        // FileMeta 里保存的是 time_t，展示到页面前先转成人类可读时间字符串。
+        const std::string modify_time = HtmlEscape(TimeUtil::FormatTime(meta.modify_time_));
+
+        // 每个文件对应表格中的一行：文件名、大小、修改时间和下载链接。
+        // 开始拼接这一行表格。
+        list_html.append("<tr>");
+        list_html.append("<td>").append(safe_filename).append("</td>");
+        list_html.append("<td>").append(std::to_string(meta.file_size_)).append("</td>");
+        list_html.append("<td>").append(modify_time).append("</td>");
+        // 第四列：下载链接。
+        list_html.append("<td><a href=\"").append(safe_link).append("\">下载</a></td>");
+        // 当前文件这一行结束。
+        list_html.append("</tr>");
+      }
+    }
+    // 模板里预留的文件列表占位符。
+    const std::string placeholder = "{{FILE_LIST}}";
+    // 在主页 HTML 模板中查找占位符位置。
+    size_t pos = html_content.find(placeholder);
+    if (pos == std::string::npos) {
+      LOG_ERROR("主页模板缺少文件列表占位符, path=%s", template_path.c_str());
+      evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
+      return;
+    }
+    // 用刚刚生成好的文件列表 HTML 替换模板中的占位符。
+    html_content.replace(pos, placeholder.size(), list_html);
+    // 把替换完成后的完整 HTML 页面返回给浏览器。
+    SendHtmlResponse(request, html_content);
+  }
 
   /*
       UploadFile:
@@ -337,10 +391,24 @@ class Service {
   /*
       SendTextResponse:
 
-      这是一个当前阶段的公共响应工具函数。主页、上传和下载三个占位处理函数都
-      先复用它返回纯文本响应，避免重复编写相同的缓冲区和响应头逻辑。
+      这里返回纯文本响应。它只指定 text/plain 类型，真正的缓冲区创建、正文写入和
+      发送流程交给 SendResponse 统一处理。
   */
-  void SendTextResponse(evhttp_request* request, const char* body) {
+  void SendTextResponse(evhttp_request* request, const std::string& body) {
+    SendResponse(request, body, "text/plain; charset=utf-8");
+  }
+
+  void SendHtmlResponse(evhttp_request* request, const std::string& body) {
+    SendResponse(request, body, "text/html; charset=utf-8");
+  }
+
+  /*
+      SendResponse:
+
+      这里统一处理普通内存响应。调用方只需要传入响应体和 Content-Type，底层仍然复
+      用同一套 evbuffer 创建、写入、发送和释放流程。
+  */
+  void SendResponse(evhttp_request* request, const std::string& body, const char* content_type) {
     // evbuffer_new: 创建响应体缓冲区，后面返回给客户端的正文会先写到这里。
     evbuffer* buffer = evbuffer_new();
     if (buffer == nullptr) {
@@ -353,11 +421,11 @@ class Service {
     evkeyvalq* output_headers = evhttp_request_get_output_headers(request);
     if (output_headers != nullptr) {
       // evhttp_add_header: 往响应头容器里添加一条头部，让客户端按指定方式解析响应体。
-      evhttp_add_header(output_headers, "Content-Type", "text/plain; charset=utf-8");
+      evhttp_add_header(output_headers, "Content-Type", content_type);
     }
 
-    // evbuffer_add_printf: 把格式化后的正文写进响应体缓冲区。
-    if (evbuffer_add_printf(buffer, "%s", body) != 0) {
+    // evbuffer_add: 把整段响应正文写进响应体缓冲区。
+    if (evbuffer_add(buffer, body.data(), body.size()) != 0) {
       LOG_ERROR("写入响应缓冲区失败");
       evbuffer_free(buffer);
       evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
@@ -368,6 +436,42 @@ class Service {
     evhttp_send_reply(request, HTTP_OK, "OK", buffer);
     // evbuffer_free: 释放响应体缓冲区，发送完成后这块临时内存就可以回收了。
     evbuffer_free(buffer);
+  }
+
+  /*
+      HtmlEscape:
+
+      这里把文件名里可能影响 HTML 结构的字符转义掉，避免客户端上传的文件名破坏页面
+      结构或形成脚本注入。
+  */
+  std::string HtmlEscape(const std::string& input) const {
+    std::string output;
+    output.reserve(input.size() + 16);
+
+    for (char c : input) {
+      switch (c) {
+        case '&':
+          output.append("&amp;");
+          break;
+        case '<':
+          output.append("&lt;");
+          break;
+        case '>':
+          output.append("&gt;");
+          break;
+        case '"':
+          output.append("&quot;");
+          break;
+        case '\'':
+          output.append("&#39;");
+          break;
+        default:
+          output.push_back(c);
+          break;
+      }
+    }
+
+    return output;
   }
 
   /*
