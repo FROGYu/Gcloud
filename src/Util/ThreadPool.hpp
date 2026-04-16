@@ -94,16 +94,20 @@ class ThreadPool {
 
       {
         std::unique_lock<std::mutex> lock(mutex_);
+        // 工作线程平时睡在这里，只有“来了新任务”或者“线程池准备停机”时才会被唤醒。
         task_ready_cv_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
 
+        // 停机后如果任务队列也已经空了，说明当前工作线程可以安全退出了。
         if (stop_ && tasks_.empty()) {
           return;
         }
 
+        // 这里把队头任务取出来，接下来会在锁外执行，避免长时间占着队列锁。
         task = std::move(tasks_.front());
         tasks_.pop();
       }
 
+      // 真正执行任务的地方在线程池锁外，避免任务本身阻塞其他线程取任务。
       task();
     }
   }
