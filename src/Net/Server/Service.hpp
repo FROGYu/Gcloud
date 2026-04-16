@@ -7,6 +7,7 @@
 #include "Util/FileUtil.hpp"
 #include "Util/TimeUtil.hpp"
 #include "Util/UniqueFd.hpp"
+#include "Util/ZstdUtil.hpp"
 
 #include <event2/buffer.h>
 #include <event2/event.h>
@@ -259,9 +260,9 @@ class Service {
   /*
       UploadFile:
 
-      这里处理普通文件上传。它先从请求头里读取文件名和存储类型，再从输入缓冲区
-      里拷贝文件正文，最后把文件写入普通存储目录，并把对应的 FileMeta 登记到
-      FileTable 中。
+      这里处理文件上传。它先从请求头里读取文件名和存储类型，再从输入缓冲区里拷
+      贝文件正文。low 直接写入普通目录，deep 会先压缩再写入深度存储目录，最后把
+      对应的 FileMeta 登记到 FileTable 中。
   */
   void UploadFile(evhttp_request* request) {
     // evhttp_request_get_input_headers: 从 request 中取出客户端发来的请求头容器。
@@ -308,16 +309,41 @@ class Service {
       return;
     }
 
-    // 拼接普通存储路径。并且保存
-    const std::string real_path = Config::Instance().GetBackDir() + file_name;
-    if (!FileUtil::WriteFile(real_path, file_body)) {
-      LOG_ERROR("上传失败, 文件落盘失败, file_name=%s, real_path=%s", file_name, real_path.c_str());
-      evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
-      return;
+    std::string real_path;
+    bool is_packed = false;
+
+    if (std::string(store_type) == "low") {
+      // low 表示普通存储，原始文件直接落到 backdir。
+      real_path = Config::Instance().GetBackDir() + file_name;
+      if (!FileUtil::WriteFile(real_path, file_body)) {
+        LOG_ERROR("上传失败, 普通文件落盘失败, file_name=%s, real_path=%s", file_name,
+                  real_path.c_str());
+        evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
+        return;
+      }
+    } else {
+      // deep 表示深度存储，先把原始正文压缩，再落到 packdir。
+      std::string packed_body;
+      if (!ZstdUtil::Compress(file_body, &packed_body)) {
+        LOG_ERROR("上传失败, 压缩文件失败, file_name=%s", file_name);
+        evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
+        return;
+      }
+
+      real_path = Config::Instance().GetPackDir() + file_name + Config::Instance().GetPackfileSuffix();
+      if (!FileUtil::WriteFile(real_path, packed_body)) {
+        LOG_ERROR("上传失败, 压缩文件落盘失败, file_name=%s, real_path=%s", file_name,
+                  real_path.c_str());
+        evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
+        return;
+      }
+
+      is_packed = true;
     }
 
     FileMeta meta{
-        .is_packed_ = false,
+        // file_size_ 继续记录原始大小，主页展示和后续业务都以用户上传的原始文件为准。
+        .is_packed_ = is_packed,
         .file_size_ = body_length,
         .modify_time_ = std::time(nullptr),
         .real_path_ = real_path,
@@ -517,8 +543,8 @@ class Service {
   /*
       IsValidStoreType:
 
-      这里校验客户端传入的存储类型。当前第一版还没有接压缩库，所以 deep 和 low 都会
-      先按普通存储落盘，但请求头本身必须是约定好的值。
+      这里校验客户端传入的存储类型。当前只接受 deep 和 low 两种取值：low 代表普
+      通存储，deep 代表压缩后再落盘。
   */
   bool IsValidStoreType(const char* store_type) const {
     if (store_type == nullptr) {
