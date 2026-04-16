@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Logger/LogMacros.hpp"
 #include "Net/Server/Data/FileMeta.hpp"
 #include "Util/FileUtil.hpp"
 
@@ -140,11 +141,46 @@ class FileTable {
     return FileUtil::WriteFile(backup_file, backup_body);
   }
 
-  // 这里预留从备份文件恢复整张元数据表的入口，后面接入 JSON 反序列化时再补实现。
+  // 这里从备份文件读取 JSON 文本，再把它还原回内存里的元数据表。
   bool Load(const std::string& backup_file) {
-    std::unique_lock<std::shared_mutex> lock(rw_lock_);
-    (void)backup_file;
-    return false;
+    std::string backup_body;
+    if (!FileUtil::ReadFile(backup_file, &backup_body) || backup_body.empty()) {
+      // 读不到或读出来为空，都按“首次启动还没有历史数据”处理。
+      return true;
+    }
+
+    try {
+      // parse 会把 JSON 文本解析成内存里的 JSON 结构。
+      nlohmann::json root = nlohmann::json::parse(backup_body);
+      if (!root.is_array()) {
+        LOG_ERROR("load file table failed, backup json is not array, file=%s", backup_file.c_str());
+        return false;
+      }
+
+      std::unordered_map<std::string, FileMeta> new_files;
+      for (const auto& item : root) {
+        // item 表示 JSON 数组里的“一条文件记录”。
+        const std::string filename = item.at("filename").get<std::string>();
+
+        FileMeta meta{
+            .is_packed_ = item.at("is_packed").get<bool>(),
+            .file_size_ = item.at("file_size").get<size_t>(),
+            .modify_time_ = item.at("modify_time").get<time_t>(),
+            .real_path_ = item.at("real_path").get<std::string>(),
+        };
+
+        // get<T>() 会把 JSON 字段取出来，并按目标类型转成 C++ 变量。
+        new_files[filename] = std::move(meta);
+      }
+
+      std::unique_lock<std::shared_mutex> lock(rw_lock_);  //独占写
+      files_.clear();
+      files_ = std::move(new_files);  //直接把 new_files 的“所有权”转给 files_
+      return true;
+    } catch (const nlohmann::json::exception& e) {
+      LOG_ERROR("load file table failed, backup_file=%s, reason=%s", backup_file.c_str(), e.what());
+      return false;
+    }
   }
 
  private:
