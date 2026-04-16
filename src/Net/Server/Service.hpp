@@ -73,6 +73,14 @@ class Service {
       return false;
     }
 
+    // 启动阶段主动恢复元数据，避免服务重启后 file_table_ 丢失历史文件记录。
+    const std::string& backup_file = Config::Instance().GetBackupFile();
+    if (!file_table_.Load(backup_file)) {
+      LOG_ERROR("加载文件元数据失败, backup_file=%s", backup_file.c_str());
+      Cleanup();
+      return false;
+    }
+
     LOG_INFO("HTTP 服务初始化成功, address=%s, port=%u", address_.c_str(),
              static_cast<unsigned>(port_));
     return true;
@@ -317,6 +325,15 @@ class Service {
 
     if (!file_table_.Insert(file_name, meta)) {
       file_table_.Update(file_name, meta);
+    }
+
+    // 元数据更新成功后立刻刷盘，保证这次上传能在下次重启后被恢复出来。
+    const std::string& backup_file = Config::Instance().GetBackupFile();
+    if (!file_table_.Store(backup_file)) {
+      LOG_ERROR("上传失败, 元数据持久化失败, file_name=%s, backup_file=%s", file_name,
+                backup_file.c_str());
+      evhttp_send_error(request, HTTP_INTERNAL, "Internal Server Error");
+      return;
     }
 
     LOG_INFO("上传成功, file_name=%s, store_type=%s, size=%zu, real_path=%s", file_name, store_type,
