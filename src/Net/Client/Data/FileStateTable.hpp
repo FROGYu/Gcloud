@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Logger/LogMacros.hpp"
+#include "Net/Client/Data/FileState.hpp"
 #include "Util/FileUtil.hpp"
 
 #include <nlohmann/json.hpp>
@@ -29,7 +30,7 @@ class FileStateTable {
       return false;
     }
 
-    files_[filename] = etag;
+    files_[filename] = FileState{.etag_ = etag};
     return true;
   }
 
@@ -47,7 +48,7 @@ class FileStateTable {
       return false;
     }
 
-    return it->second == etag;
+    return it->second.etag_ == etag;
   }
 
   /*
@@ -61,12 +62,12 @@ class FileStateTable {
 
     // json::array() 明确说明最外层要构造的是 JSON 数组。
     nlohmann::json root = nlohmann::json::array();
-    for (const auto& [filename, etag] : files_) {
+    for (const auto& [filename, state] : files_) {
       nlohmann::json item;
 
       // item 表示数组中的“一条文件状态记录”，这里按字段名逐项写入。
       item["filename"] = filename;
-      item["etag"] = etag;
+      item["etag"] = state.etag_;
 
       // push_back 会把当前这条记录追加到 JSON 数组末尾。
       root.push_back(item);
@@ -98,12 +99,12 @@ class FileStateTable {
         return false;
       }
 
-      std::unordered_map<std::string, std::string> new_files;
+      std::unordered_map<std::string, FileState> new_files;
       for (const auto& item : root) {
         // get<T>() 会把 JSON 字段取出来，并转换成目标 C++ 类型。
         const std::string filename = item.at("filename").get<std::string>();
         const std::string etag = item.at("etag").get<std::string>();
-        new_files[filename] = etag;
+        new_files[filename] = FileState{.etag_ = etag};
       }
 
       files_ = std::move(new_files);
@@ -125,6 +126,6 @@ class FileStateTable {
   size_t Size() const { return files_.size(); }
 
  private:
-  // files_ 保存“文件名 -> ETag”的对应关系，是客户端判断是否需要重新上传的依据。
-  std::unordered_map<std::string, std::string> files_;
+  // files_ 保存“文件名 -> FileState”的对应关系，是客户端判断是否需要重新上传的依据。
+  std::unordered_map<std::string, FileState> files_;
 };
