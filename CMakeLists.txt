@@ -6,11 +6,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# 项目公共头文件路径，nlohmann/json 是单头文件库，只需要加入 include 路径。
+# 项目公共头文件路径。nlohmann/json 和 cpp-httplib 都是单头文件库，只需要加入 include 路径。
 set(GCLOUD_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann_json/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cpp_httplib
 )
 
 # 统一给项目内目标挂载公共 include，避免每个 add_executable 后重复写一遍。
