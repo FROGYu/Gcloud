@@ -1,54 +1,42 @@
-#include "Logger/LogMacros.hpp"
-#include "Util/LoggerInit.hpp"
+#include "Net/Client/ClientMain.hpp"
+#include "Net/Server/ServerMain.hpp"
 
-#include <thread>
-#include <vector>
+#include <cstdio>
+#include <string>
 
 namespace {
-constexpr int kThreadCount = 4;
-constexpr int kLogCountPerThread = 400;
 
-const RotateLoggerConfig kDefaultRotateLoggerConfig = {
-    .logger_name = "default",
-    .base_file_name = "rotate_test.log",
-    .max_file_size = 64 * 1024,
-};
-
-void runRotateFlushTest() {
-  // 这里启动多个业务线程，持续写日志。
-  // 如果 SizeRotateFileFlush 正常工作，
-  // 运行结束后应该能在 src/Logger/logs 里看到多个 rotate_test_*.log 文件。
-  std::vector<std::thread> workers;
-
-  for (int i = 0; i < kThreadCount; ++i) {
-    workers.emplace_back([i]() {
-      for (int j = 0; j < kLogCountPerThread; ++j) {
-        LOG_INFO("rotate test: thread=%d, log_index=%d", i, j);
-      }
-    });
-  }
-
-  for (auto &worker : workers) {
-    worker.join();
-  }
-}
+/*
+    这里打印统一用法说明。当前总入口只负责模式分发，不直接参与服务端和客户端的具
+    体业务，所以命令行帮助也统一收在这里维护。
+*/
+void PrintUsage(const char* program_name) {
+  std::fprintf(stderr,
+               "Usage:\n"
+               "  %s server [listen_ip] [listen_port]\n"
+               "  %s client [server_ip] [server_port] [sync_dir] [backup_file]\n",
+               program_name, program_name);
 }
 
-int main() {
-  /*
-      这次 main 的验证目标：
-      - 验证 SizeRotateFileFlush 是否会在文件即将超过上限前切到新文件
-      - 验证 LoggerManager 和 LOG_INFO 宏在这个场景下仍然能正常工作
+}  // namespace
 
-      只保留一个日志器：
-      - 先把“按大小切文件”这件事单独验证清楚
-      - 不把多个日志器共享同一个输出器的并发问题混进来
-  */
+int main(int argc, char* argv[]) {
+  if (argc < 2) {
+    PrintUsage(argv[0]);
+    return 1;
+  }
 
-  // 这里完成日志系统初始化。
-  // 业务代码不再自己手动创建输出器、日志器和注册流程。
-  InitDefaultRotateLogger(__FILE__, kDefaultRotateLoggerConfig);
-  runRotateFlushTest();
+  const std::string mode = argv[1];
+  if (mode == "server") {
+    // argv + 1 表示把 "server" 当作子模块自己的 argv[0]，后面的监听参数继续顺次转发。
+    return RunServerMain(argc - 1, argv + 1);
+  }
 
-  return 0;
+  if (mode == "client") {
+    // argv + 1 表示把 "client" 当作子模块自己的 argv[0]，后面的同步参数继续顺次转发。
+    return RunClientMain(argc - 1, argv + 1);
+  }
+
+  PrintUsage(argv[0]);
+  return 1;
 }

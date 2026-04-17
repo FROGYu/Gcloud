@@ -6,6 +6,11 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# 外部动态库配置。nlohmann/json 和 cpp-httplib 是头文件库，zstd 和 libevent 需要链接系统库。
+find_package(Threads REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(ZSTD REQUIRED libzstd)
+
 # 项目公共头文件路径。nlohmann/json 和 cpp-httplib 都是单头文件库，只需要加入 include 路径。
 set(GCLOUD_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -21,11 +26,33 @@ function(gcloud_configure_target target_name)
     )
 endfunction()
 
-# 主程序入口，后续云存储服务端会从这里启动。
+# 统一给需要线程支持的目标挂载线程库。
+function(gcloud_link_thread_runtime target_name)
+    target_link_libraries(${target_name} PRIVATE
+        Threads::Threads
+    )
+endfunction()
+
+# 统一给服务端目标挂载 zstd 和 libevent。
+function(gcloud_link_server_runtime target_name)
+    target_include_directories(${target_name} PRIVATE
+        ${ZSTD_INCLUDE_DIRS}
+    )
+    target_link_libraries(${target_name} PRIVATE
+        ${ZSTD_LIBRARIES}
+        event
+    )
+endfunction()
+
+# 服务端主程序入口。
 add_executable(${PROJECT_NAME}
     src/main.cpp
+    src/Net/Server/ServerMain.cpp
+    src/Net/Client/ClientMain.cpp
 )
 gcloud_configure_target(${PROJECT_NAME})
+gcloud_link_thread_runtime(${PROJECT_NAME})
+gcloud_link_server_runtime(${PROJECT_NAME})
 
 # net_lab 保留网络演进实验代码：阻塞、select、epoll 服务端与客户端。
 add_executable(blocking_server
@@ -47,16 +74,3 @@ add_executable(epoll_server
     src/net_lab/epoll_server.cpp
 )
 gcloud_configure_target(epoll_server)
-
-# 外部动态库配置。nlohmann/json 是头文件库，zstd 和 libevent 需要链接系统库。
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(ZSTD REQUIRED libzstd)
-
-target_include_directories(${PROJECT_NAME} PRIVATE
-    ${ZSTD_INCLUDE_DIRS}
-)
-
-target_link_libraries(${PROJECT_NAME} PRIVATE
-    ${ZSTD_LIBRARIES}
-    event
-)
