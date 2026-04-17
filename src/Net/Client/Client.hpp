@@ -6,9 +6,11 @@
 
 #include <httplib.h>
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <thread>
 
 namespace fs = std::filesystem;
 
@@ -20,13 +22,78 @@ namespace fs = std::filesystem;
 */
 class Client {
  public:
-  Client(std::string server_ip = "127.0.0.1", uint16_t server_port = 8080)
-      : server_ip_(std::move(server_ip)), server_port_(server_port) {}
+  Client(std::string server_ip = "127.0.0.1", uint16_t server_port = 8080,
+         std::string sync_dir = "./client_sync/", std::string backup_file = "./client_backup.json")
+      : server_ip_(std::move(server_ip)),
+        server_port_(server_port),
+        sync_dir_(std::move(sync_dir)),
+        backup_file_(std::move(backup_file)) {}
 
   ~Client() = default;
 
   Client(const Client&) = delete;
   Client& operator=(const Client&) = delete;
+
+  /*
+      这里启动客户端同步引擎。它会先恢复本地历史状态，然后不断扫描 sync_dir_，
+      找出新增或被修改过的文件，上传成功后立刻更新 FileStateTable 并保存到本地备份。
+  */
+  void Run() {
+    if (!file_state_table_.Load(backup_file_)) {
+      LOG_ERROR("客户端启动失败, 加载本地状态表失败, backup_file=%s", backup_file_.c_str());
+      return;
+    }
+
+    LOG_INFO("客户端同步引擎启动, sync_dir=%s, backup_file=%s", sync_dir_.c_str(),
+             backup_file_.c_str());
+
+    while (true) {
+      std::error_code ec;
+      if (!fs::exists(sync_dir_, ec) || ec) {
+        LOG_ERROR("扫描同步目录失败, 目录不存在, sync_dir=%s", sync_dir_.c_str());
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        continue;
+      }
+
+      // directory_iterator 会把 sync_dir_ 目录下的每个目录项逐个枚举出来。
+      for (const auto& entry : fs::directory_iterator(sync_dir_)) {
+        // 这里只同步普通文件，目录、链接和其他特殊文件直接跳过。
+        if (!entry.is_regular_file()) {
+          continue;
+        }
+
+        const std::string filepath = entry.path().string();
+
+        // filename() 只取路径最后一段文件名，不带前面的目录部分。
+        const std::string filename = entry.path().filename().string();
+        const std::string etag = GetETag(filepath);
+        if (etag.empty()) {
+          continue;
+        }
+
+        if (file_state_table_.IsSameState(filename, etag)) {
+          continue;
+        }
+
+        if (!Upload(filepath, filename)) {
+          continue;
+        }
+
+        if (!file_state_table_.Record(filename, etag)) {
+          LOG_ERROR("记录客户端状态失败, filename=%s", filename.c_str());
+          continue;
+        }
+
+        if (!file_state_table_.Save(backup_file_)) {
+          LOG_ERROR("保存客户端状态失败, backup_file=%s", backup_file_.c_str());
+          continue;
+        }
+      }
+
+      // sleep_for 让当前线程暂停 1 秒，避免客户端死循环把 CPU 持续跑满。
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+  }
 
  private:
   /*
@@ -107,6 +174,12 @@ class Client {
 
   // server_port_ 保存目标服务端端口，和 server_ip_ 一起组成上传目标。
   uint16_t server_port_ = 8080;
+
+  // sync_dir_ 保存客户端当前要监控的本地同步目录。
+  std::string sync_dir_ = "./client_sync/";
+
+  // backup_file_ 保存客户端本地状态表的备份文件路径。
+  std::string backup_file_ = "./client_backup.json";
 
   // file_state_table_ 保存客户端记住的本地文件状态，后面扫描目录时会先拿它判断是否要上传。
   FileStateTable file_state_table_;
